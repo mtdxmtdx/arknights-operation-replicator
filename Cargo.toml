@@ -1,0 +1,69 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/repl-core",
+    "crates/repl-frames",
+    "crates/repl-input",
+    "crates/repl-vision",
+    "crates/repl-capture",
+    "crates/repl-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+# 本项目移植了 MaaAssistantArknights (AGPL-3.0-only) 与
+# arknights-frame-assistant (GPL-3.0-only) 的代码，两者都是 copyleft。
+# GPLv3 §13 允许把 GPLv3 作品与 AGPLv3 作品合并，合并结果需受 AGPLv3 §13
+# 的网络交互条款约束 —— 因此整体只能是 AGPL-3.0-only。详见 THIRD-PARTY-NOTICES.md。
+license = "AGPL-3.0-only"
+repository = "https://github.com/mtdxmtdx/arknights-operation-replicator"
+
+[workspace.dependencies]
+repl-core = { path = "crates/repl-core" }
+repl-frames = { path = "crates/repl-frames" }
+repl-input = { path = "crates/repl-input" }
+repl-vision = { path = "crates/repl-vision" }
+repl-capture = { path = "crates/repl-capture" }
+
+anyhow = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 用软件渲染器而不是 Skia：
+#  1. Skia 的预编译产物与本机 MSVC STL 版本对不上，链接会失败
+#     (__std_find_first_of_trivial_pos_1 未解析)；
+#  2. 这个界面就是几行文字和方块，软件渲染完全够用，还省掉几十 MB 二进制
+#     和一整套 GPU 依赖 —— 与"低占用"的目标一致。
+slint = { version = "1.8", default-features = false, features = [
+    "compat-1-2",
+    "backend-winit",
+    "renderer-software",
+    "std",
+] }
+slint-build = "1.8"
+thiserror = "2"
+tungstenite = "0.24"
+
+[workspace.dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

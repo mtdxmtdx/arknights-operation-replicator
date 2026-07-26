@@ -1,0 +1,30 @@
+[package]
+name = "repl-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+env_logger.workspace = true
+image.workspace = true
+log.workspace = true
+repl-capture.workspace = true
+repl-core.workspace = true
+repl-frames.workspace = true
+repl-input.workspace = true
+repl-vision.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+slint.workspace = true
+
+[build-dependencies]
+slint-build.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Globalization",
+    "Win32_System_Console",
+    "Win32_UI_Controls_Dialogs",
+] }

@@ -1,0 +1,8 @@
+/target
+*.pdb
+/config.json
+/bindings.json
+/log
+/replicator.log
+/deploy-scan.png
+/tile-preview-*.png

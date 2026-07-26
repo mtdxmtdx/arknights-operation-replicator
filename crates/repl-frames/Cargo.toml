@@ -1,0 +1,18 @@
+[package]
+name = "repl-frames"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# 导出 source::fake::FakeFrameSource，供下游 crate 的离线回放测试使用。
+test-util = []
+
+[dependencies]
+log.workspace = true
+repl-core.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+thiserror.workspace = true
+tungstenite.workspace = true

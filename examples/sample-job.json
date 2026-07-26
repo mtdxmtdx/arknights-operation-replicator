@@ -1,0 +1,53 @@
+{
+  "_comment": [
+    "帧复刻作业示例。格式是 MAA copilot schema 的超集：",
+    "现成的 MAA 作业可以直接拿来，给每个动作补上 frame 字段、",
+    "再加一个顶层 frame_replicator 块即可。",
+    "",
+    "frame 是【绝对逻辑帧】—— 从战斗开始算起的累计帧数，1 倍速下 30 帧 = 1 秒。",
+    "帧号必须非递减；相等表示同一帧内依次执行多个动作。",
+    "",
+    "MAA 原有的 kills / costs / cost_changes / cooling / pre_delay / post_delay",
+    "会被解析但忽略 —— 帧模式下等待条件只看 frame。"
+  ],
+
+  "stage_name": "main_01-07",
+
+  "frame_replicator": {
+    "version": 1,
+    "speed": "1x",
+    "after_last_action": "resume"
+  },
+
+  "doc": {
+    "title": "示例：单干员三动作",
+    "details": "用来验收端到端流程。先自己在游戏里把编队排好，再装载本作业。"
+  },
+
+  "opers": [
+    { "name": "桃金娘", "skill": 1 }
+  ],
+
+  "actions": [
+    {
+      "type": "Deploy",
+      "frame": 10,
+      "name": "桃金娘",
+      "location": [3, 2],
+      "direction": "Right",
+      "doc": "第 10 帧部署。开局暂停通常停在第 1-4 帧（截图与按键有延迟），首个动作的帧号必须不小于实际停住的帧，写 0 会直接报「错过开局」"
+    },
+    {
+      "type": "Skill",
+      "frame": 60,
+      "name": "桃金娘",
+      "doc": "两秒后开技能"
+    },
+    {
+      "type": "Retreat",
+      "frame": 180,
+      "name": "桃金娘",
+      "doc": "六秒后撤退"
+    }
+  ]
+}

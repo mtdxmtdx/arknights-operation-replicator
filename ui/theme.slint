@@ -1,0 +1,54 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Arknights Operation Replicator contributors
+//
+// 配色沿用 ArknightsCostBarRuler 的深色 HUD 观感（自行实现，未复制上游代码）。
+
+export global Theme {
+    out property <brush> bg: #14161a;
+    out property <brush> panel: #1c2026;
+    out property <brush> panel-alt: #232830;
+    out property <brush> line: #2e343d;
+
+    out property <brush> text: #e6e9ee;
+    out property <brush> text-dim: #8b939f;
+
+    out property <brush> accent: #ffd54a;
+    out property <brush> ok: #5ec26a;
+    out property <brush> warn: #f0a020;
+    out property <brush> error: #e05252;
+    out property <brush> idle: #4a515c;
+
+    out property <length> gap: 8px;
+    out property <length> pad: 12px;
+    out property <length> radius: 4px;
+}
+
+/// 一个小圆点状态灯。
+export component Dot inherits Rectangle {
+    in property <brush> tint: Theme.idle;
+    width: 8px;
+    height: 8px;
+    border-radius: 4px;
+    background: tint;
+}
+
+/// 带标题的一栏状态。
+export component Field inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> value;
+    in property <brush> value-color: Theme.text;
+    spacing: 6px;
+    Text {
+        text: label;
+        color: Theme.text-dim;
+        font-size: 12px;
+        vertical-alignment: center;
+    }
+    Text {
+        text: value;
+        color: value-color;
+        font-size: 12px;
+        font-weight: 600;
+        vertical-alignment: center;
+    }
+}
