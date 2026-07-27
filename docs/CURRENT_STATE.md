@@ -25,7 +25,7 @@
   XButton/滚轮走鼠标事件；AFA INI 键名集中定义但必须通过首次实机日志验证。
 - 只读核对同工作区 AFA 源码后，已确认键名来自 `src/lib/config.ahk`，发布工作流使用 `AFA.exe`；
   这不替代用户机器上的实际配置值和热键捕获验收。
-- 当前阶段分支为 `develop`；改动仍未提交。根目录旧二进制/日志和兼容修复前
+- 当前阶段分支为 `develop`，已建立本地检查点并推送到 `origin/develop`。根目录旧二进制/日志和兼容修复前
   生成的日志不能作为本轮验收证据；实机证据来自 20:09 后构建的 `target\release\repl-app.exe`。
 - 只读检查用户 `%APPDATA%\ArknightsFrameAssistant\PC\Settings.ini` 的六项验收配置均符合预期：
   `PressPause=g`、`ReleasePause=Space`、`PauseSkill=XButton2`、`PauseRetreat=XButton1`、
