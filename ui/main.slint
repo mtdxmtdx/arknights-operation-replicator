@@ -115,6 +115,8 @@ export component MainWindow inherits Window {
     in property <string> ruler-profile: "未校准";
     in property <bool> game-found;
     in property <string> battle-state: "—";
+    in property <bool> afa-ready;
+    in property <string> afa-detail: "未检测";
     in property <int> cursor-frame;
     in property <int> target-frame: -1;
     in property <string> phase: "空闲";
@@ -162,6 +164,11 @@ export component MainWindow inherits Window {
                         label: "游戏";
                         ok: game-found;
                         detail: game-found ? battle-state : "未找到窗口";
+                    }
+                    StatusLight {
+                        label: "AFA";
+                        ok: afa-ready;
+                        detail: afa-ready ? "已就绪" : afa-detail;
                     }
                     Rectangle { }
                     Field { label: "阶段"; value: phase; value-color: Theme.accent; }

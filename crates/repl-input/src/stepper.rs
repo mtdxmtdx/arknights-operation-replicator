@@ -101,13 +101,16 @@ impl PauseController {
         self.exit_key
     }
 
-    /// 进入暂停（AFA 的"按下暂停"）。
-    pub fn pause(&self) -> Result<(), InputError> {
+    /// 诊断工具直接进入暂停。
+    ///
+    /// 主复刻路径的普通暂停必须走 [`crate::AfaController`]；这个入口只给
+    /// `step-test` 等测量工具使用，避免把 Rust 时序重新带回运行期。
+    pub fn diagnostic_pause(&self) -> Result<(), InputError> {
         key_tap(self.enter_key, DEFAULT_TAP_HOLD)
     }
 
-    /// 退出暂停（AFA 的"松开暂停"）。
-    pub fn resume(&self) -> Result<(), InputError> {
+    /// 诊断工具直接退出暂停。
+    pub fn diagnostic_resume(&self) -> Result<(), InputError> {
         key_tap(self.exit_key, DEFAULT_TAP_HOLD)
     }
 

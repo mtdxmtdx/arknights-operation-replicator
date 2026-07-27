@@ -51,6 +51,8 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.set_actions(ModelRc::new(VecModel::<ActionRow>::default()));
     ui.set_cards(ModelRc::new(VecModel::<CardRow>::default()));
     ui.set_unbound_opers(ModelRc::new(VecModel::<SharedString>::default()));
+    ui.set_afa_ready(false);
+    ui.set_afa_detail("未检测".into());
 
     let ruler = Arc::new(RulerClient::connect(config.borrow().ruler_ws_url.clone()));
     let copilot: Rc<RefCell<Option<Copilot>>> = Rc::new(RefCell::new(None));
@@ -177,6 +179,16 @@ fn main() -> Result<(), slint::PlatformError> {
                 ui.set_status_line("请先装载作业".into());
                 return;
             };
+            let afa = repl_input::AfaController::probe();
+            if !afa.ready {
+                ui.set_status_line(format!("AFA 未就绪：{}", afa.detail).into());
+                append_log(
+                    &ui,
+                    &log,
+                    &format!("开始被拒绝：AFA 未就绪：{}", afa.detail),
+                );
+                return;
+            }
             cancel.store(false, Ordering::Relaxed);
             ui.set_running(true);
             ui.set_status_line("正在准备…".into());
@@ -235,6 +247,7 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let ui_weak = ui.as_weak();
         let ruler = Arc::clone(&ruler);
+        let copilot = Rc::clone(&copilot);
         let timer = slint::Timer::default();
         // 管线停滞检测：frameId 长时间不涨 = 尺子没在分析新画面。
         // 注意静止画面（菜单挂机）下 WGC 不产帧、frameId 停住是正常的，
@@ -246,6 +259,14 @@ fn main() -> Result<(), slint::PlatformError> {
             move || {
                 let Some(ui) = ui_weak.upgrade() else { return };
                 ui.set_ruler_connected(ruler.status().is_connected());
+                let afa = repl_input::AfaController::probe();
+                ui.set_afa_ready(afa.ready);
+                ui.set_afa_detail(afa.detail.into());
+                if !afa.ready {
+                    ui.set_can_start(false);
+                } else if !ui.get_running() && copilot.borrow().is_some() {
+                    ui.set_can_start(true);
+                }
                 if let Some(snapshot) = ruler.latest() {
                     ui.set_ruler_profile(
                         snapshot
@@ -456,7 +477,9 @@ fn pump_progress(
                     }
                     Progress::ActionStarted { index, frame } => {
                         set_row_status(&ui, index, 1);
-                        ui.set_status_line(format!("第 {frame} 帧：正在注入动作 #{index}").into());
+                        ui.set_status_line(
+                            format!("第 {frame} 帧：正在派发并等待动作 #{index} 确认").into(),
+                        );
                     }
                     Progress::ActionDone { index } => set_row_status(&ui, index, 2),
                     Progress::Log(line) => append_log(&ui, &log, &line),

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Arknights Operation Replicator contributors
 //
-// 动作执行时序移植自 MaaAssistantArknights (AGPL-3.0-only) 的
-//   src/MaaCore/Task/BattleHelper.cpp (deploy_oper / use_skill / retreat_oper)
-// 与 arknights-frame-assistant (GPL-3.0-only) 的
-//   src/lib/hotkey_actions.ahk (ActionPauseSelect / ActionPauseSkill / ActionPauseRetreat)
+// 部署手势移植自 MaaAssistantArknights (AGPL-3.0-only) 的
+//   src/MaaCore/Task/BattleHelper.cpp (deploy_oper)
+// 逐帧脉冲和计时原语移植自 arknights-frame-assistant (GPL-3.0-only) 的
+//   src/lib/hotkey_actions.ahk；技能/撤退选中时序不在本项目复制，而由外部 AFA 委托执行。
 // 详见仓库根目录 THIRD-PARTY-NOTICES.md。
 
 //! 一次复刻会话：把状态机的抽象指令翻译成真实的触控和按键。
@@ -19,31 +19,11 @@ use repl_core::{
     gesture, Direction, Level, LevelPack, Point, TileProjection, Viewport,
 };
 use repl_input::{
-    game_keys::func,
-    keys::{key_down, key_up},
-    mouse, precise_sleep, GameKeys, PauseController, TouchInjector,
+    mouse, precise_sleep, AfaAction, AfaController, GameKeys, PauseController, TouchInjector,
 };
 use repl_vision::{Card, Template, TemplateSet};
 
 use crate::config::{Binding, Config};
-
-/// 暂停按钮左半 / 右半的客户区比例。来自 AFA 的 `PauseButtonPositionLeft/Right`。
-///
-/// 为什么要分左右两个点：暂停态下无法选中场上干员，必须"瞬间解暂停 → 点选 → 再暂停"，
-/// 而两次点击落在**同一像素**会被游戏当成双击吞掉。错开一点就没事。
-const PAUSE_BTN_LEFT: (f64, f64) = (0.9400, 0.0700);
-const PAUSE_BTN_RIGHT: (f64, f64) = (0.9650, 0.0700);
-
-/// AFA ActionPauseSkill/Retreat 的 ClickDelay：三触控完成后、按键按下前的短延迟。
-///
-/// 给游戏时间处理最后一次重暂停边沿。AFA 根据帧率动态调整，我们用固定 100ms。
-const CLICK_DELAY: Duration = Duration::from_millis(100);
-
-/// 按键按住的总时长（从 key_down 到 key_up 之间）。
-///
-/// AFA 在按键期间会保持约 1000ms（CurrentDelay * 1.5），期间发送 TouchInjector.Move。
-/// 我们无法实现 Move（Windows API 参数错误），但保持相同的按键持续时长。
-const KEY_HOLD_DURATION: Duration = Duration::from_millis(950);
 
 /// 一次复刻会话持有的全部运行期资源。
 pub struct Session {
@@ -55,7 +35,9 @@ pub struct Session {
     pub projection: TileProjection,
     pub templates: TemplateSet,
     touch: TouchInjector,
+    /// 逐帧脉冲仍由 Rust 直接控制；普通暂停/恢复和技能/撤退走 AFA。
     pub pause: PauseController,
+    pub afa: AfaController,
     pub game_keys: GameKeys,
     /// 干员名 → 头像模板，用于在部署栏里认出这张卡。
     avatars: HashMap<String, Template>,
@@ -97,6 +79,8 @@ impl Session {
             ));
         }
 
+        let afa = AfaController::discover().context("AFA 预检失败")?;
+
         TouchInjector::initialize().context("初始化触控注入失败")?;
         let game_keys = GameKeys::load();
         if !game_keys.from_registry() {
@@ -124,6 +108,7 @@ impl Session {
             templates,
             touch: TouchInjector::new(),
             pause: PauseController::new(&game_keys),
+            afa,
             game_keys,
             avatars: HashMap::new(),
             battlefield: HashMap::new(),
@@ -215,6 +200,38 @@ impl Session {
         }
     }
 
+    /// 通过 AFA 触发普通暂停。失焦时直接失败，不抢焦点、不重发热键。
+    pub fn pause_battle(&self) -> Result<()> {
+        self.ensure_foreground()?;
+        self.afa
+            .dispatch(AfaAction::PressPause)
+            .context("AFA 普通暂停热键失败")
+    }
+
+    /// 通过 AFA 触发普通恢复。失焦时直接失败，不抢焦点、不重发热键。
+    pub fn resume_battle(&self) -> Result<()> {
+        self.ensure_foreground()?;
+        self.afa
+            .dispatch(AfaAction::ReleasePause)
+            .context("AFA 普通恢复热键失败")
+    }
+
+    /// 逐帧推进仍由 Rust 直接控制；这是运行期唯一的直接暂停脉冲入口。
+    pub fn pulse(&self, gap: Duration) -> Result<()> {
+        self.ensure_foreground()?;
+        self.pause.pulse(gap).context("逐帧脉冲失败")
+    }
+
+    fn ensure_foreground(&self) -> Result<()> {
+        if self.window.is_foreground() {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "游戏窗口不在前台；按计划不自动抢焦点或重发 AFA 热键"
+            ))
+        }
+    }
+
     /// 部署：从卡片拖到格子，再拖一下设定朝向；拖拽完成后动作立即结束。
     ///
     /// 游戏此刻已经被停在目标帧上，所以**不做** MAA 的 swipe-with-pause ——
@@ -289,83 +306,26 @@ impl Session {
         Ok(())
     }
 
-    /// 开技能：先"暂停时选中"，等重暂停生效，再按技能键；技能键是最后一次输入。
-    ///
-    /// AFA `ActionPauseSkill` 的完整顺序（逐行对照 hotkey_actions.ahk 162–186 行）：
-    ///
-    /// 1. `Tap(左半)` — 触控触发解暂停
-    /// 2. `Tap(干员)` — 触控点击干员（选中）
-    /// 3. `Tap(右半)` — 触控触发重暂停
-    ///    ↑ 三次 Tap 共约 3ms，远小于一帧（16.7ms），游戏来不及进入子弹时间
-    /// 4. `sleep(CLICK_DELAY)` — 短延迟，等游戏处理重暂停边沿
-    /// 5. `key_down(技能键)` — 按键按下，开始保持
-    /// 6. `sleep(KEY_HOLD_DURATION)` — 保持功能键
-    /// 7. `TouchInjector.Move` + `MouseMove` — 通知游戏触控交互结束并恢复鼠标位置
-    /// 8. `sleep(50ms)` — AFA 松键前的收尾延迟
-    /// 9. `key_up(技能键)` — 松开按键，动作结束
+    /// 技能动作完全交给 AFA：复刻器只把目标干员交给当前鼠标位置，再触发 AFA 热键。
     fn do_skill(&mut self, action: &Action) -> Result<()> {
         let target = self.resolve_target(action)?;
         let screen = self.geometry.client_to_screen(target);
-        let key = self
-            .game_keys
-            .get(func::RELEASE_SKILL)
-            .ok_or_else(|| anyhow!("没有可用的技能键绑定"))?;
-        self.select_while_paused(target)?;
-        precise_sleep(CLICK_DELAY);
-        key_down(key)?;
-        precise_sleep(KEY_HOLD_DURATION);
-        let finish_result = (|| -> Result<()> {
-            // AFA 不检查 TouchInjector.Move 的返回值；部分 Windows 环境会以
-            // ERROR_INVALID_PARAMETER 拒绝无接触触控，但仍必须继续 MouseMove 和松键。
-            if let Err(e) = self.touch.hover(screen) {
-                log::warn!(
-                    "AFA skill hover failed for {} at {screen}; continuing with MouseMove: {e}",
-                    action.name
-                );
-            }
-            mouse::set_cursor_pos(screen)?;
-            precise_sleep(Duration::from_millis(50));
-            Ok(())
-        })();
-        // Hover / MouseMove 失败时也必须释放功能键，不能让游戏一直收到按下状态。
-        let key_up_result = key_up(key).context("释放技能键失败");
-        finish_result?;
-        key_up_result?;
+        mouse::set_cursor_pos(screen).context("把技能目标交给 AFA 失败")?;
+        self.afa
+            .dispatch(AfaAction::PauseSkill)
+            .context("AFA 暂停技能热键失败")?;
         log::info!("skill on {} at {target}", action.name);
         Ok(())
     }
 
-    /// 撤退：先"暂停时选中"，等重暂停生效，再按撤退键；撤退键是最后一次输入。
-    ///
-    /// 同 `do_skill`，参见其文档注释。完成后不再补发 cancel_selection——
-    /// 让状态机根据下一个动作决定是继续推帧还是直接收尾，避免多余输入。
+    /// 撤退动作完全交给 AFA：复刻器只把目标干员交给当前鼠标位置，再触发 AFA 热键。
     fn do_retreat(&mut self, action: &Action) -> Result<()> {
         let target = self.resolve_target(action)?;
         let screen = self.geometry.client_to_screen(target);
-        let key = self
-            .game_keys
-            .get(func::RETREAT_CHAR)
-            .ok_or_else(|| anyhow!("没有可用的撤退键绑定"))?;
-        self.select_while_paused(target)?;
-        precise_sleep(CLICK_DELAY);
-        key_down(key)?;
-        precise_sleep(KEY_HOLD_DURATION);
-        let finish_result = (|| -> Result<()> {
-            // 与 AFA 一致：Move 是 best-effort，失败不能阻断 MouseMove 和松键。
-            if let Err(e) = self.touch.hover(screen) {
-                log::warn!(
-                    "AFA retreat hover failed for {} at {screen}; continuing with MouseMove: {e}",
-                    action.name
-                );
-            }
-            mouse::set_cursor_pos(screen)?;
-            precise_sleep(Duration::from_millis(50));
-            Ok(())
-        })();
-        // Hover / MouseMove 失败时也必须释放功能键，不能让游戏一直收到按下状态。
-        let key_up_result = key_up(key).context("释放撤退键失败");
-        finish_result?;
-        key_up_result?;
+        mouse::set_cursor_pos(screen).context("把撤退目标交给 AFA 失败")?;
+        self.afa
+            .dispatch(AfaAction::PauseRetreat)
+            .context("AFA 暂停撤退热键失败")?;
         if let Some(loc) = self.battlefield.remove(&action.name) {
             log::info!("retreat {} from {loc}", action.name);
         }
@@ -393,23 +353,6 @@ impl Session {
             return Err(anyhow!("格子 {loc} 投影到了屏幕外 {reference}，点不到"));
         }
         Ok(self.viewport.field_to_client(reference))
-    }
-
-    /// 暂停时选中场上干员：Tap(左半) → Tap(目标) → Tap(右半)。
-    ///
-    /// AFA `ActionPauseSelect` 的完整实现（hotkey_actions.ahk 88–110 行）。
-    /// 三次 Tap 共约 3ms，远小于一帧（16.7ms），游戏来不及进入子弹时间就已重暂停。
-    /// 完成后的短延迟与功能键保持时长由调用者按 AFA 时序执行。
-    fn select_while_paused(&mut self, target: Point) -> Result<()> {
-        let left = self.client_ratio(PAUSE_BTN_LEFT);
-        let right = self.client_ratio(PAUSE_BTN_RIGHT);
-        // AFA 的目标来自当前鼠标位置，因此三触控开始前鼠标本来就在干员上。
-        // 我们平时把鼠标停在安全区，必须先恢复这个前提。
-        mouse::set_cursor_pos(self.geometry.client_to_screen(target))?;
-        self.tap(left)?;
-        self.tap(target)?;
-        self.tap(right)?;
-        Ok(())
     }
 
     /// 参考坐标 → 客户区像素。识别结果都要过这一步才能拿去点。
@@ -441,13 +384,6 @@ impl Session {
         }
     }
 
-    fn client_ratio(&self, (rx, ry): (f64, f64)) -> Point {
-        Point::new(
-            (f64::from(self.geometry.width) * rx).round() as i32,
-            (f64::from(self.geometry.height) * ry).round() as i32,
-        )
-    }
-
     /// 点一下（客户区坐标）。
     pub fn tap(&mut self, client: Point) -> Result<()> {
         let screen = self.geometry.client_to_screen(client);
@@ -475,24 +411,5 @@ impl Session {
     /// 紧急收尾：抬起可能卡住的触点。
     pub fn release_inputs(&mut self) {
         self.touch.release_if_down();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pause_button_halves_are_distinct() {
-        // 两次点击必须落在不同像素，否则会被当成双击吞掉
-        assert_ne!(PAUSE_BTN_LEFT, PAUSE_BTN_RIGHT);
-        // 都应当在右上角的暂停按钮区域内
-        for (x, y) in [PAUSE_BTN_LEFT, PAUSE_BTN_RIGHT] {
-            assert!((0.9..1.0).contains(&x), "x 比例 {x} 不在右侧");
-            assert!((0.0..0.15).contains(&y), "y 比例 {y} 不在顶部");
-        }
-        // 在 1920 宽的窗口上两点相距应当有十几像素，足以避开双击判定
-        let gap = ((PAUSE_BTN_RIGHT.0 - PAUSE_BTN_LEFT.0) * 1920.0).round() as i32;
-        assert!(gap >= 10, "两点间距只有 {gap}px，可能仍被当成双击");
     }
 }

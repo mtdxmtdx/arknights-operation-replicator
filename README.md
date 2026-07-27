@@ -11,9 +11,9 @@
 
 ## 状态
 
-核心流程已实现，但端到端验收尚未通过 —— 按 [ACCEPTANCE.md](ACCEPTANCE.md) 逐节执行。
-当前阻塞项是：技能或撤退作为最后一个动作时，日志会显示动作全部完成，游戏实机却没有
-保持在最后目标帧的暂停状态（2026-07-27）。
+核心流程已实现，但本轮 AFA 委托重构尚未完成端到端实机验收 —— 按 [ACCEPTANCE.md](ACCEPTANCE.md)
+逐节执行。技能和撤退现在由 AFA 执行，复刻器只在派发后的新尺子样本确认目标帧与暂停状态后
+才把动作标记为完成。
 
 | 验收节 | 状态 |
 | --- | --- |
@@ -21,19 +21,24 @@
 | 2 单帧脉冲精度 | ✅ 实机通过（100 次脉冲 0 跨帧、35% 命中，纯自旋定时修复后） |
 | 3 地图坐标投影 | ✅ 实机通过（1-7，绿十字对齐格子中心，人工核对） |
 | 4 部署栏识别 | ✅ 实机通过（2560×1440，`uiScaler=0`，职业判定已人工核对） |
-| 5 端到端复刻 | ❌ 未通过（最后操作后未保持暂停，2026-07-27） |
+| 5 端到端复刻 | ⚠️ 实机部分通过但未稳定：连续 4 次完成，随后 1 次开局尺子盲区导致首目标越过 |
 | 6 资源占用 | ✅ 12.9MB 二进制，空闲私有工作集 5.4MB |
 
-168 个单元测试全绿，clippy 无告警。含用 10 个真实关卡数据验证的地图投影、
-状态机的全部中止路径。凡是需要真实触控生效的部分，只能在装了游戏的机器上验。
+输入适配、AFA 解析和动作确认测试已通过；`cargo test --workspace`、clippy、release 构建、
+格式检查和 diff 检查均已通过。实机已证明 AFA 能完成 Deploy → Skill → Retreat 并在目标帧
+暂停，但首目标过早时仍可能因开局费用条不可读而越过，尚不能开始录像 10/10 帧号核验。
 
 ## 运行前提
 
 1. **Windows 10/11**，《明日方舟》**PC 客户端**（`Arknights.exe`）。
-2. **[ArknightsCostBarRuler](https://github.com/ZeroAd-06/ArknightsCostBarRuler)** 独立运行，
+2. **AFA（Arknights Frame Assistant）** 已由用户以管理员权限启动；复刻器只读
+   `%APPDATA%\ArknightsFrameAssistant\PC\Settings.ini`，要求 `PressPause`、
+   `ReleasePause`、`PauseSkill`、`PauseRetreat` 四项热键有效，且开启 AFA 自动开局暂停、
+   关闭卫戍协议默认模式。AFA 不可用时复刻器不会回退旧 Rust 时序。
+3. **[ArknightsCostBarRuler](https://github.com/ZeroAd-06/ArknightsCostBarRuler)** 独立运行，
    并已完成一次费用条校准。它是帧数的唯一真源，复刻器通过其 `127.0.0.1:2606`
    本地 API 读取绝对帧。
-3. 一份 **MAA 资源目录**（`resource/`），用于地图格子投影和部署栏识别。可以是已安装的
+4. 一份 **MAA 资源目录**（`resource/`），用于地图格子投影和部署栏识别。可以是已安装的
    [MaaAssistantArknights](https://github.com/MaaAssistantArknights/MaaAssistantArknights)，
    也可以单独获取其资源仓库。**本仓库不分发这些游戏资源文件**，首次运行向导会让你指定路径。
 
@@ -69,7 +74,7 @@ MAA copilot schema 的超集：现成 MAA 作业加上每个动作的 `frame`（
 ```
 crates/
 ├─ repl-core/    纯逻辑：作业模型、地图投影、坐标映射、部署手势、帧复刻状态机
-├─ repl-frames/  尺子的 WebSocket / HTTP 客户端
+├─ repl-frames/  尺子的 WebSocket 客户端
 ├─ repl-input/   触控注入（InjectTouchInput）、键盘、游戏内键位、逐帧脉冲
 ├─ repl-vision/  部署栏识别（纯 Rust 模板匹配，不依赖 OpenCV）
 ├─ repl-capture/ 窗口定位 + Windows Graphics Capture 按需截图

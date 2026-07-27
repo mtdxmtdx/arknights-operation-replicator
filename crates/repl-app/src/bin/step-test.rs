@@ -163,7 +163,7 @@ fn main() {
     // 不管刚才把游戏搞成什么状态，都先停回暂停态。
     if let Ok(s) = ruler.wait_next(0, Duration::from_millis(600)) {
         if s.battle_state.as_ref().and_then(|b| b.is_paused()) == Some(false) {
-            let _ = pause.pause();
+            let _ = pause.diagnostic_pause();
             std::thread::sleep(Duration::from_millis(300));
         }
     }

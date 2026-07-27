@@ -56,9 +56,14 @@ AGPL-3.0 与 GPL-3.0 的合并依据是 GPLv3 第 13 条：GPLv3 明确允许把
 | `repl-input/src/game_keys.ahk` 对应的 `repl-input/src/game_keys.rs` | `src/lib/game_keys.ahk`（注册表 `KEYBOARD_SETTING_V*` 读取与解析、Unity keyId → 按键名映射表、默认按键） |
 | `repl-input/src/stepper.rs` | `src/lib/hotkey_actions.ahk` (`Action16ms` / `Action33ms` / `Action166ms` 的暂停脉冲时序) |
 | `repl-input/src/clock.rs` | `src/lib/hotkey_actions.ahk` (`USleep` 的 QPC 自旋延时) |
-| `repl-app/src/session.rs` 中的选中/技能/撤退时序 | `src/lib/hotkey_actions.ahk` (`ActionPauseSelect` / `ActionPauseSkill` / `ActionPauseRetreat` 的三连点和功能键时序) |
-| 开局暂停的像素触发器 | `src/lib/hotkey_actions.ahk` (`ActionBeginPause`) |
 | `repl-core/src/lib.rs` 中的 `LOGICAL_FPS_1X` 等常量 | 上游 README 的"关于游戏内帧率"一节 |
+
+当前版本的 `repl-app/src/session.rs` **不再移植**上游的
+`ActionPauseSelect` / `ActionPauseSkill` / `ActionPauseRetreat` 的选中与功能键
+时序。它只负责部署触控、把 Skill / Retreat 的目标定位到当前鼠标位置，并向
+用户已启动的外部 AFA 发送一次配置中的热键；AFA 的技能/撤退时序仍由 AFA 自己执行。
+`repl-input/src/afa.rs` 是本项目的只读 INI 适配与 `SendInput` 委托代码，不是对 AFA
+源代码的复制。复刻器不修改 AFA 配置，也不在 AFA 不可用时回退这段已移除的 Rust 时序。
 
 ## ArknightsCostBarRuler
 
