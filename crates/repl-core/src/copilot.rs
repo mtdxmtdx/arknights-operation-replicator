@@ -22,11 +22,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::geom::{Direction, Point};
 
-/// 最后一个动作执行完之后怎么办。
+/// 旧版的最后动作收尾选项。
+///
+/// 为兼容已有作业仍继续解析；复刻器现在会在最后动作返回后立即停止注入，
+/// `resume` 与 `pause` 不再改变运行时行为。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AfterLastAction {
-    /// 恢复运行，让战斗自己打完。
+    /// 旧版：恢复运行。现仅作为兼容值保留。
     #[default]
     Resume,
     /// 保持暂停，交回给用户。

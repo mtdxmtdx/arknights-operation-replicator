@@ -56,7 +56,7 @@ AGPL-3.0 与 GPL-3.0 的合并依据是 GPLv3 第 13 条：GPLv3 明确允许把
 | `repl-input/src/game_keys.ahk` 对应的 `repl-input/src/game_keys.rs` | `src/lib/game_keys.ahk`（注册表 `KEYBOARD_SETTING_V*` 读取与解析、Unity keyId → 按键名映射表、默认按键） |
 | `repl-input/src/stepper.rs` | `src/lib/hotkey_actions.ahk` (`Action16ms` / `Action33ms` / `Action166ms` 的暂停脉冲时序) |
 | `repl-input/src/clock.rs` | `src/lib/hotkey_actions.ahk` (`USleep` 的 QPC 自旋延时) |
-| `repl-core/src/machine.rs` 中的选中/技能/撤退时序 | `src/lib/hotkey_actions.ahk` (`ActionPauseSelect` / `ActionPauseSkill` / `ActionPauseRetreat` 的"暂停键左半 → 目标 → 暂停键右半"三连点) |
+| `repl-app/src/session.rs` 中的选中/技能/撤退时序 | `src/lib/hotkey_actions.ahk` (`ActionPauseSelect` / `ActionPauseSkill` / `ActionPauseRetreat` 的三连点和功能键时序) |
 | 开局暂停的像素触发器 | `src/lib/hotkey_actions.ahk` (`ActionBeginPause`) |
 | `repl-core/src/lib.rs` 中的 `LOGICAL_FPS_1X` 等常量 | 上游 README 的"关于游戏内帧率"一节 |
 

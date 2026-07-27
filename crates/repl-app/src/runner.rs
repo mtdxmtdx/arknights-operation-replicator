@@ -17,7 +17,7 @@ use std::{
 use anyhow::{anyhow, Result};
 use repl_core::{
     machine::{AbortReason, Command, Completion, FrameView, Machine, Phase},
-    Copilot,
+    Action, Copilot,
 };
 use repl_frames::{FrameError, FrameSource, Snapshot};
 use repl_input::{precise_sleep, TimerResolution};
@@ -80,8 +80,6 @@ const SLOW_STEP_PAUSE: Duration = Duration::from_millis(1000);
 /// 到达目标帧后、注入动作前的等待时长。
 ///
 /// 给游戏时间确认"已暂停、已停在目标帧"的状态，再开始触控和键盘注入。
-/// 对 Skill/Retreat：这段时间内尺子快照稳定，select_while_paused 后的
-/// 选中状态也在这里确认；key_tap 在此之后发出，游戏必定已收到选中。
 const PRE_ACTION_PAUSE: Duration = Duration::from_secs(2);
 
 /// 一次复刻运行。
@@ -171,20 +169,8 @@ impl<'a> Runner<'a> {
                     // 逐帧推进阶段：每次脉冲前先等 SLOW_STEP_PAUSE。
                     // 这给游戏和尺子充足的稳定时间，避免在状态未稳定时解暂停
                     // （选中 UI 动画、费用条抖动等都会在这里安全地结束）。
-                    let gap = if self.machine.phase() == Phase::Stepping {
-                        if !self.stabilize_pause(SLOW_STEP_PAUSE)? {
-                            continue;
-                        }
-                        // 稳定窗口可能消费了最后一帧，重新计算间隔。
-                        let Command::Pulse { gap } = self.machine.next_command() else {
-                            continue;
-                        };
-                        gap
-                    } else {
-                        gap
-                    };
-                    if self.machine.phase() != Phase::Stepping || !self.machine.is_paused() {
-                        continue;
+                    if self.machine.phase() == Phase::Stepping {
+                        precise_sleep(SLOW_STEP_PAUSE);
                     }
                     self.session.pause.pulse(gap)?;
                     self.machine.completed(Completion::PulseSent);
@@ -212,7 +198,7 @@ impl<'a> Runner<'a> {
                         index,
                         frame: action.frame,
                     });
-                    match self.session.execute(&action) {
+                    match self.execute_action(&action) {
                         Ok(()) => {
                             let _ = self.events.send(Progress::ActionDone { index });
                             self.machine.completed(Completion::ActionExecuted);
@@ -224,19 +210,19 @@ impl<'a> Runner<'a> {
                     }
                 }
 
-                Command::Finish { resume } => {
-                    if resume {
-                        self.session.pause.resume()?;
-                    }
-                    let _ = self.events.send(Progress::Log(if resume {
-                        "全部动作已注入，已恢复运行".into()
-                    } else {
-                        "全部动作已注入，游戏保持暂停".into()
-                    }));
+                Command::Finish => {
+                    self.note(format!(
+                        "全部动作已注入（最后目标帧 {}），不再发送任何输入",
+                        self.machine.cursor()
+                    ));
                     return Ok(());
                 }
             }
         }
+    }
+
+    fn execute_action(&mut self, action: &Action) -> Result<()> {
+        self.session.execute(action)
     }
 
     fn report_phase(&self) {
@@ -371,46 +357,6 @@ impl<'a> Runner<'a> {
             }
         }
         Err(anyhow!("等待开局超时（5 分钟）"))
-    }
-
-    /// 在脉冲前的稳定窗口内保持暂停，并持续消费新的尺子样本。
-    /// 如果暂停丢失，取消当前脉冲，让状态机重新请求暂停。
-    fn stabilize_pause(&mut self, duration: Duration) -> Result<bool> {
-        let deadline = Instant::now() + duration;
-        while Instant::now() < deadline {
-            if self.cancel.load(Ordering::Relaxed) {
-                self.machine.user_abort();
-                return Ok(false);
-            }
-
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            match self.frames.wait_next(
-                self.machine.last_frame_id(),
-                remaining.min(Duration::from_millis(100)),
-            ) {
-                Ok(snapshot) => {
-                    let view = to_view(&snapshot);
-                    let accepted = self.machine.observe(&view);
-                    if self.machine.phase() == Phase::Aborted {
-                        return Err(anyhow!(
-                            "{}",
-                            self.machine
-                                .abort_reason()
-                                .expect("aborted machine has a reason")
-                        ));
-                    }
-                    if (accepted && !self.machine.is_paused())
-                        || (view.trustworthy && view.paused == Some(false))
-                    {
-                        self.note("脉冲前检测到暂停已丢失，取消本次脉冲并重新确认".into());
-                        return Ok(false);
-                    }
-                }
-                Err(FrameError::Timeout(_)) => {}
-                Err(e) => return Err(anyhow!("{e}")),
-            }
-        }
-        Ok(self.machine.is_paused())
     }
 
     /// 等一条新的、可信的尺子样本。

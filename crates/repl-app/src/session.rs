@@ -16,11 +16,12 @@ use anyhow::{anyhow, Context, Result};
 use repl_capture::{ClientGeometry, Frame, GameWindow, WindowCapturer};
 use repl_core::{
     copilot::{Action, ActionType},
-    gesture, Direction, Level, LevelPack, Point, Rect, TileProjection, Viewport,
+    gesture, Direction, Level, LevelPack, Point, TileProjection, Viewport,
 };
 use repl_input::{
-    game_keys::func, key_tap, keys::DEFAULT_TAP_HOLD, precise_sleep, GameKeys, PauseController,
-    TouchInjector,
+    game_keys::func,
+    keys::{key_down, key_up},
+    mouse, precise_sleep, GameKeys, PauseController, TouchInjector,
 };
 use repl_vision::{Card, Template, TemplateSet};
 
@@ -33,16 +34,16 @@ use crate::config::{Binding, Config};
 const PAUSE_BTN_LEFT: (f64, f64) = (0.9400, 0.0700);
 const PAUSE_BTN_RIGHT: (f64, f64) = (0.9650, 0.0700);
 
-/// 暂停时选中干员后，等待游戏确认选中状态的时长。
+/// AFA ActionPauseSkill/Retreat 的 ClickDelay：三触控完成后、按键按下前的短延迟。
 ///
-/// 三次 Tap 完成重暂停后，游戏需要一帧左右才能确认"已选中"状态；
-/// 在此之前发技能键或撤退键，游戏尚未进入"已选中"模式，按键会被吞掉。
-/// 1 秒远超必要时间，配合 runner 里的 PRE_ACTION_PAUSE 给整个注入阶段
-/// 提供充分的稳定缓冲。
-const POST_SELECT_PAUSE: Duration = Duration::from_secs(1);
+/// 给游戏时间处理最后一次重暂停边沿。AFA 根据帧率动态调整，我们用固定 100ms。
+const CLICK_DELAY: Duration = Duration::from_millis(100);
 
-/// MAA 的 `BattleCancelSelection.specificRect`（1280×720 参考坐标）。
-const CANCEL_SELECTION_REF: Rect = Rect::new(630, 0, 20, 20);
+/// 按键按住的总时长（从 key_down 到 key_up 之间）。
+///
+/// AFA 在按键期间会保持约 1000ms（CurrentDelay * 1.5），期间发送 TouchInjector.Move。
+/// 我们无法实现 Move（Windows API 参数错误），但保持相同的按键持续时长。
+const KEY_HOLD_DURATION: Duration = Duration::from_millis(950);
 
 /// 一次复刻会话持有的全部运行期资源。
 pub struct Session {
@@ -214,7 +215,7 @@ impl Session {
         }
     }
 
-    /// 部署：从卡片拖到格子，再拖一下设定朝向。
+    /// 部署：从卡片拖到格子，再拖一下设定朝向；拖拽完成后动作立即结束。
     ///
     /// 游戏此刻已经被停在目标帧上，所以**不做** MAA 的 swipe-with-pause ——
     /// 那会在拖拽中途再发一次 ESC，把游戏从暂停切回运行。
@@ -288,7 +289,7 @@ impl Session {
         Ok(())
     }
 
-    /// 开技能：先"暂停时选中"，再在暂停+选中状态下按技能键。
+    /// 开技能：先"暂停时选中"，等重暂停生效，再按技能键；技能键是最后一次输入。
     ///
     /// AFA `ActionPauseSkill` 的完整顺序（逐行对照 hotkey_actions.ahk 162–186 行）：
     ///
@@ -296,42 +297,78 @@ impl Session {
     /// 2. `Tap(干员)` — 触控点击干员（选中）
     /// 3. `Tap(右半)` — 触控触发重暂停
     ///    ↑ 三次 Tap 共约 3ms，远小于一帧（16.7ms），游戏来不及进入子弹时间
-    /// 4. `sleep(CLICK_DELAY)` — 等选中稳定（游戏此时已重暂停）
-    /// 5. `key_tap(技能键)` — 在暂停且已选中状态下按键，有效
-    ///
-    /// 错误的顺序（之前的实现）是把技能键夹在 Tap(干员) 和 Tap(右半) 之间：
-    /// `key_tap` 有 50ms hold，游戏在重暂停之前运行了 50ms，足以进入子弹时间；
-    /// 状态机检测到 0.2x 速度后中止。
+    /// 4. `sleep(CLICK_DELAY)` — 短延迟，等游戏处理重暂停边沿
+    /// 5. `key_down(技能键)` — 按键按下，开始保持
+    /// 6. `sleep(KEY_HOLD_DURATION)` — 保持功能键
+    /// 7. `TouchInjector.Move` + `MouseMove` — 通知游戏触控交互结束并恢复鼠标位置
+    /// 8. `sleep(50ms)` — AFA 松键前的收尾延迟
+    /// 9. `key_up(技能键)` — 松开按键，动作结束
     fn do_skill(&mut self, action: &Action) -> Result<()> {
         let target = self.resolve_target(action)?;
+        let screen = self.geometry.client_to_screen(target);
         let key = self
             .game_keys
             .get(func::RELEASE_SKILL)
             .ok_or_else(|| anyhow!("没有可用的技能键绑定"))?;
         self.select_while_paused(target)?;
-        precise_sleep(POST_SELECT_PAUSE);
-        key_tap(key, DEFAULT_TAP_HOLD)?;
+        precise_sleep(CLICK_DELAY);
+        key_down(key)?;
+        precise_sleep(KEY_HOLD_DURATION);
+        let finish_result = (|| -> Result<()> {
+            // AFA 不检查 TouchInjector.Move 的返回值；部分 Windows 环境会以
+            // ERROR_INVALID_PARAMETER 拒绝无接触触控，但仍必须继续 MouseMove 和松键。
+            if let Err(e) = self.touch.hover(screen) {
+                log::warn!(
+                    "AFA skill hover failed for {} at {screen}; continuing with MouseMove: {e}",
+                    action.name
+                );
+            }
+            mouse::set_cursor_pos(screen)?;
+            precise_sleep(Duration::from_millis(50));
+            Ok(())
+        })();
+        // Hover / MouseMove 失败时也必须释放功能键，不能让游戏一直收到按下状态。
+        let key_up_result = key_up(key).context("释放技能键失败");
+        finish_result?;
+        key_up_result?;
         log::info!("skill on {} at {target}", action.name);
         Ok(())
     }
 
-    /// 撤退：先"暂停时选中"，再在暂停+选中状态下按撤退键。
+    /// 撤退：先"暂停时选中"，等重暂停生效，再按撤退键；撤退键是最后一次输入。
     ///
-    /// 同 `do_skill`，参见其文档注释。
+    /// 同 `do_skill`，参见其文档注释。完成后不再补发 cancel_selection——
+    /// 让状态机根据下一个动作决定是继续推帧还是直接收尾，避免多余输入。
     fn do_retreat(&mut self, action: &Action) -> Result<()> {
         let target = self.resolve_target(action)?;
+        let screen = self.geometry.client_to_screen(target);
         let key = self
             .game_keys
             .get(func::RETREAT_CHAR)
             .ok_or_else(|| anyhow!("没有可用的撤退键绑定"))?;
         self.select_while_paused(target)?;
-        precise_sleep(POST_SELECT_PAUSE);
-        key_tap(key, DEFAULT_TAP_HOLD)?;
-
+        precise_sleep(CLICK_DELAY);
+        key_down(key)?;
+        precise_sleep(KEY_HOLD_DURATION);
+        let finish_result = (|| -> Result<()> {
+            // 与 AFA 一致：Move 是 best-effort，失败不能阻断 MouseMove 和松键。
+            if let Err(e) = self.touch.hover(screen) {
+                log::warn!(
+                    "AFA retreat hover failed for {} at {screen}; continuing with MouseMove: {e}",
+                    action.name
+                );
+            }
+            mouse::set_cursor_pos(screen)?;
+            precise_sleep(Duration::from_millis(50));
+            Ok(())
+        })();
+        // Hover / MouseMove 失败时也必须释放功能键，不能让游戏一直收到按下状态。
+        let key_up_result = key_up(key).context("释放撤退键失败");
+        finish_result?;
+        key_up_result?;
         if let Some(loc) = self.battlefield.remove(&action.name) {
             log::info!("retreat {} from {loc}", action.name);
         }
-        self.cancel_selection()?;
         Ok(())
     }
 
@@ -362,23 +399,17 @@ impl Session {
     ///
     /// AFA `ActionPauseSelect` 的完整实现（hotkey_actions.ahk 88–110 行）。
     /// 三次 Tap 共约 3ms，远小于一帧（16.7ms），游戏来不及进入子弹时间就已重暂停。
-    /// 完成后用 `precise_sleep(CLICK_DELAY)` 等游戏确认选中状态，再发功能键。
+    /// 完成后的短延迟与功能键保持时长由调用者按 AFA 时序执行。
     fn select_while_paused(&mut self, target: Point) -> Result<()> {
         let left = self.client_ratio(PAUSE_BTN_LEFT);
         let right = self.client_ratio(PAUSE_BTN_RIGHT);
+        // AFA 的目标来自当前鼠标位置，因此三触控开始前鼠标本来就在干员上。
+        // 我们平时把鼠标停在安全区，必须先恢复这个前提。
+        mouse::set_cursor_pos(self.geometry.client_to_screen(target))?;
         self.tap(left)?;
         self.tap(target)?;
         self.tap(right)?;
         Ok(())
-    }
-
-    fn cancel_selection(&mut self) -> Result<()> {
-        let rect = self.viewport.hud_rect(
-            CANCEL_SELECTION_REF,
-            repl_core::HAnchor::Left,
-            repl_core::VAnchor::Top,
-        );
-        self.tap(rect.center())
     }
 
     /// 参考坐标 → 客户区像素。识别结果都要过这一步才能拿去点。
@@ -463,10 +494,5 @@ mod tests {
         // 在 1920 宽的窗口上两点相距应当有十几像素，足以避开双击判定
         let gap = ((PAUSE_BTN_RIGHT.0 - PAUSE_BTN_LEFT.0) * 1920.0).round() as i32;
         assert!(gap >= 10, "两点间距只有 {gap}px，可能仍被当成双击");
-    }
-
-    #[test]
-    fn cancel_selection_rect_matches_maa() {
-        assert_eq!(CANCEL_SELECTION_REF, Rect::new(630, 0, 20, 20));
     }
 }

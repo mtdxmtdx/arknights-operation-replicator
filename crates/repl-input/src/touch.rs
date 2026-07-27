@@ -15,7 +15,7 @@
 //! 2. **触控注入不会移动系统鼠标指针。** 而 Arknights PC 会自绘光标，一旦光标
 //!    盖住费用条或费用数字，尺子就会把该帧标记 `cursorBlocked` 并冻结分析
 //!    （见尺子的 `pc_cursor_guard.rs`）—— 那样我们就拿不到帧数了。
-//!    所以全程只用触控、绝不移动鼠标，是这个项目能工作的前提之一。
+//!    所以平时把鼠标停在安全区；暂停中选中前只做一次纯鼠标位移到目标，不点击。
 //!
 //! 坐标一律是**屏幕坐标**。客户区 → 屏幕的换算由调用方（`repl-capture` 的
 //! `GameWindow`）负责。
@@ -118,6 +118,18 @@ impl TouchInjector {
         self.up(screen)
     }
 
+    /// 无接触悬停（AFA 的 `TouchInjector.Move`）。
+    ///
+    /// 不要求当前有触点按下；先发送 `INRANGE | UPDATE`，再用 `UP` 结束这次
+    /// 指针序列。无论调用前的本地状态如何，成功后都视为没有触点按下。
+    pub fn hover(&mut self, screen: Point) -> Result<(), InputError> {
+        self.last = screen;
+        self.inject(screen, Flags::Hover)?;
+        self.inject(screen, Flags::Up)?;
+        self.down = false;
+        Ok(())
+    }
+
     /// 沿给定路径滑动：按下起点 → 依次经过中间点 → 在终点抬起。
     ///
     /// `step` 是相邻两点之间的间隔，MAA 的 minitouch 用的是 10ms。
@@ -162,6 +174,7 @@ impl TouchInjector {
             Flags::Down => POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_DOWN,
             Flags::Update => POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_UPDATE,
             Flags::Up => POINTER_FLAG_UP,
+            Flags::Hover => POINTER_FLAG_INRANGE | POINTER_FLAG_UPDATE,
         };
 
         let mut info = POINTER_TOUCH_INFO::default();
@@ -200,6 +213,7 @@ enum Flags {
     Down,
     Update,
     Up,
+    Hover,
 }
 
 #[cfg(test)]

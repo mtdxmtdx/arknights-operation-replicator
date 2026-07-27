@@ -19,7 +19,7 @@
 use std::time::Duration;
 
 use crate::{
-    copilot::{ActionType, AfterLastAction, Copilot},
+    copilot::{ActionType, Copilot},
     stepping::GapTuner,
 };
 
@@ -66,8 +66,6 @@ pub enum Phase {
     WaitingBattle,
     /// 已发出开局暂停，等一条可信的暂停态样本来确认。
     ConfirmingZero,
-    /// 已发出运行期暂停，等待尺子确认游戏已暂停。
-    ConfirmingPause,
     /// 编队匹配（用户把作业干员和部署栏卡片对上）。
     BindingFormation,
     /// 正常运行，等着接近目标帧。
@@ -88,7 +86,6 @@ impl Phase {
             Self::Idle => "空闲",
             Self::WaitingBattle => "等待开局",
             Self::ConfirmingZero => "确认开局暂停",
-            Self::ConfirmingPause => "确认暂停",
             Self::BindingFormation => "编队匹配",
             Self::Cruising => "正常运行",
             Self::Stepping => "逐帧推进",
@@ -119,8 +116,8 @@ pub enum Command {
     Execute { index: usize },
     /// 等下一条尺子样本。
     AwaitFrame { timeout: Duration },
-    /// 收尾。
-    Finish { resume: bool },
+    /// 最后动作已执行且没有后续动作；直接收尾，不再发送任何输入。
+    Finish,
     /// 中止。
     Abort(AbortReason),
     /// 已经结束，没有更多事要做。
@@ -130,7 +127,7 @@ pub enum Command {
 /// 调用方对一条命令的回报。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Completion {
-    /// 已发出暂停键，等待尺子确认。
+    /// 已发出开局暂停键。
     PauseSent,
     /// 已发出恢复键。
     ResumeSent,
@@ -159,6 +156,8 @@ pub enum AbortReason {
     FrameTimeout,
     /// 暂停键没生效（多半是代理指挥 / 托管）。
     PauseIneffective,
+    /// 脉冲已经发出，但尺子长时间没有看到它回到暂停态。
+    PulseDidNotSettle { state: String },
     /// 执行动作时出错。
     ExecutionFailed(String),
     /// 用户手动中止。
@@ -205,6 +204,10 @@ impl std::fmt::Display for AbortReason {
                 f,
                 "发了暂停键但游戏仍在推进。如果开着代理指挥或托管，请先关掉"
             ),
+            Self::PulseDidNotSettle { state } => write!(
+                f,
+                "逐帧脉冲后迟迟没有恢复暂停（当前 {state}）。为避免重复切换导致超跑，复刻已中止"
+            ),
             Self::ExecutionFailed(what) => write!(f, "执行动作失败：{what}"),
             Self::UserAborted => write!(f, "用户中止"),
         }
@@ -223,14 +226,14 @@ pub struct Machine {
     action_index: usize,
     /// 游戏当前是否被我们停住了。
     paused: bool,
-    /// 运行期暂停键已经发出，但还没有收到尺子的暂停确认。
-    pause_pending: bool,
-    /// 当前接近目标帧的暂停请求已经重试了多少次。
-    pause_attempts: u8,
+    /// 运行期 Pause 已发送，但还没有收到尺子的暂停确认。
+    pause_in_flight: bool,
     /// 已消费到的最新 `frame_id`。
     last_frame_id: u64,
     /// 刚发过一次脉冲，等着看它推进了几帧。
     pulse_in_flight: bool,
+    /// 当前脉冲尚未回到暂停态时已经看到的新样本数。
+    pulse_settle_samples: u32,
     /// 发脉冲之前的游标，用来算实际推进量。
     pulse_from: i64,
     /// 已发暂停键、还没确认生效时，记录当时的帧数，用于检测暂停无效。
@@ -249,11 +252,12 @@ pub struct Machine {
 /// 也能在半秒内识破真正的暂停失效（代理指挥 / 托管会一直涨下去）。
 const PAUSE_PROBE_LIMIT: u32 = 8;
 
-/// 接近动作目标时的运行期暂停确认窗口要短于开场窗口，给重试留下安全帧余量。
+/// 接近目标帧时给显式 Pause 留出的确认样本数。
+/// 4 条覆盖已知的 2–4 条输入/分析延迟，同时不会耗尽 8 帧安全余量。
 const RUNTIME_PAUSE_PROBE_LIMIT: u32 = 4;
 
-/// 单次暂停确认失败后允许重新发送的次数。
-const PAUSE_RETRY_LIMIT: u8 = 2;
+/// 脉冲中间态最多容忍的新样本数；按约 60Hz 分析相当于约 267ms。
+const PULSE_SETTLE_SAMPLE_LIMIT: u32 = 16;
 
 /// 动作注入完成后，允许尺子短暂报告 0.2x 的新样本数。
 ///
@@ -273,10 +277,10 @@ impl Machine {
             origin: 0,
             action_index: 0,
             paused: false,
-            pause_pending: false,
-            pause_attempts: 0,
+            pause_in_flight: false,
             last_frame_id: 0,
             pulse_in_flight: false,
+            pulse_settle_samples: 0,
             pulse_from: 0,
             pause_probe: None,
             point_two_samples: None,
@@ -298,11 +302,6 @@ impl Machine {
 
     pub fn phase(&self) -> Phase {
         self.phase
-    }
-
-    /// 返回最近一条可信尺子样本确认的暂停状态。
-    pub fn is_paused(&self) -> bool {
-        self.paused
     }
 
     pub fn cursor(&self) -> i64 {
@@ -336,6 +335,12 @@ impl Machine {
     /// 所以用它等待不会重复收到已经被拒绝过的样本。
     pub fn last_frame_id(&self) -> u64 {
         self.last_frame_id
+    }
+
+    /// 上层在动作注入期间自行检查过一条尺子样本时，同步等待游标，避免后续阶段
+    /// 重新消费动作前的旧快照。这里只推进 `frame_id`，不改变逻辑帧或暂停结论。
+    pub fn acknowledge_frame_id(&mut self, frame_id: u64) {
+        self.last_frame_id = self.last_frame_id.max(frame_id);
     }
 
     /// 已完成 / 总动作数。
@@ -432,9 +437,7 @@ impl Machine {
         match self.phase {
             Phase::WaitingBattle => self.observe_waiting(view),
             Phase::ConfirmingZero => self.observe_confirming(view),
-            Phase::Cruising | Phase::Stepping | Phase::ConfirmingPause => {
-                self.observe_running(view)
-            }
+            Phase::Cruising | Phase::Stepping => self.observe_running(view),
             _ => {}
         }
         true
@@ -456,8 +459,6 @@ impl Machine {
         self.cursor = view.elapsed;
         if view.paused == Some(true) {
             self.pause_probe = None;
-            self.pause_pending = false;
-            self.pause_attempts = 0;
             self.paused = true;
             self.origin = view.elapsed;
 
@@ -501,14 +502,15 @@ impl Machine {
         let Some(target) = self.target() else {
             return;
         };
-        let previous = self.cursor;
         self.cursor = view.elapsed;
 
-        if self.pulse_in_flight {
+        // 尺子可能先看到脉冲的 1x_running 中间态，之后才看到 pauseBattle 边沿落地。
+        // 必须保持事务在途，直到更新的快照确认最终暂停态。
+        if self.pulse_in_flight && view.paused == Some(true) {
             self.tuner.observe(self.cursor - self.pulse_from);
             self.pulse_in_flight = false;
+            self.pulse_settle_samples = 0;
         }
-        let _ = previous;
 
         if self.cursor > target {
             self.fail(AbortReason::OvershotTarget {
@@ -518,35 +520,30 @@ impl Machine {
             return;
         }
 
-        if self.pause_pending {
-            if view.paused == Some(true) {
-                self.pause_pending = false;
-                self.pause_probe = None;
-                self.pause_attempts = 0;
-                self.paused = true;
-                self.phase = Phase::Stepping;
-                return;
+        if self.pulse_in_flight {
+            if let Some(paused) = view.paused {
+                self.paused = paused;
             }
+            self.pulse_settle_samples += 1;
+            if self.pulse_settle_samples >= PULSE_SETTLE_SAMPLE_LIMIT {
+                self.fail(AbortReason::PulseDidNotSettle {
+                    state: view.battle_state.clone(),
+                });
+            }
+            return;
+        }
 
-            self.paused = false;
-            if let Some((from, count)) = self.pause_probe {
-                if self.cursor > from {
+        if self.pause_in_flight {
+            if view.paused == Some(true) {
+                self.pause_in_flight = false;
+                self.pause_probe = None;
+                self.paused = true;
+            } else {
+                self.paused = false;
+                if let Some((_, count)) = self.pause_probe {
                     let count = count + 1;
                     if count >= RUNTIME_PAUSE_PROBE_LIMIT {
-                        if self.pause_attempts < PAUSE_RETRY_LIMIT {
-                            self.pause_attempts += 1;
-                            self.pause_pending = false;
-                            self.pause_probe = None;
-                            self.phase = Phase::Stepping;
-                            log::warn!(
-                                "pause confirmation failed; retrying ({}/{}) at frame {}",
-                                self.pause_attempts,
-                                PAUSE_RETRY_LIMIT,
-                                self.cursor,
-                            );
-                        } else {
-                            self.fail(AbortReason::PauseIneffective);
-                        }
+                        self.fail(AbortReason::PauseIneffective);
                     } else {
                         self.pause_probe = Some((self.cursor, count));
                     }
@@ -554,7 +551,6 @@ impl Machine {
             }
             return;
         }
-
         if let Some(paused) = view.paused {
             self.paused = paused;
         }
@@ -579,9 +575,6 @@ impl Machine {
             Phase::ConfirmingZero => Command::AwaitFrame {
                 timeout: AWAIT_TIMEOUT,
             },
-            Phase::ConfirmingPause => Command::AwaitFrame {
-                timeout: AWAIT_TIMEOUT,
-            },
 
             Phase::BindingFormation => Command::BindFormation,
 
@@ -592,14 +585,20 @@ impl Machine {
     fn next_running_command(&mut self) -> Command {
         let Some(target) = self.target() else {
             self.phase = Phase::Finished;
-            return Command::Finish {
-                resume: self.copilot.meta.after_last_action == AfterLastAction::Resume,
-            };
+            return Command::Finish;
         };
 
         let remaining = target - self.cursor;
 
-        if self.pause_pending {
+        // 脉冲本身已经包含重暂停边沿；稳定前禁止补发 Pause，否则额外切换会把游戏重新放开。
+        if self.pulse_in_flight {
+            self.phase = Phase::Stepping;
+            return Command::AwaitFrame {
+                timeout: AWAIT_TIMEOUT,
+            };
+        }
+        if self.pause_in_flight {
+            self.phase = Phase::Stepping;
             return Command::AwaitFrame {
                 timeout: AWAIT_TIMEOUT,
             };
@@ -636,11 +635,6 @@ impl Machine {
         }
         // 已暂停且还没到点：发一次脉冲，然后等结果。
         self.phase = Phase::Stepping;
-        if self.pulse_in_flight {
-            return Command::AwaitFrame {
-                timeout: AWAIT_TIMEOUT,
-            };
-        }
         // 最后一步是唯一致命的一步：这里 +2 就直接越过目标、整场作废
         // （更早的 +2 只是离目标更近，无害；remaining==2 时 +2 甚至正好落在目标上）。
         // 实测推进量几乎不随 gap 变化，但脉冲的解暂停窗口 ∝ gap ——
@@ -661,27 +655,27 @@ impl Machine {
                     self.phase = Phase::ConfirmingZero;
                     self.pause_probe = None;
                 } else {
-                    // 运行期暂停必须等尺子确认，不能把按键发送成功当成游戏已暂停。
+                    // 运行期 Pause 只表示按键已发送；必须等尺子确认后才能进入慢速等待。
                     self.paused = false;
-                    self.pause_pending = true;
+                    self.pause_in_flight = true;
                     self.pause_probe = Some((self.cursor, 0));
-                    self.phase = Phase::ConfirmingPause;
                 }
             }
             Completion::ResumeSent => {
                 self.paused = false;
-                self.pause_pending = false;
+                self.pause_in_flight = false;
                 self.pause_probe = None;
-                self.pause_attempts = 0;
+                self.pulse_settle_samples = 0;
             }
             Completion::PulseSent => {
                 self.pulse_in_flight = true;
+                self.pulse_settle_samples = 0;
                 self.pulse_from = self.cursor;
             }
             // 这两个都回到推进逻辑，由 next_running_command 决定下一步：
             // 同帧还有动作就接着注入，帧号更大就巡航/推进，没动作了就收尾。
-            // 注意**不要**在这里直接置 Finished —— 那样 Finish 命令就发不出去了，
-            // 调用方也就不知道该恢复运行还是保持暂停。
+            // 注意**不要**在这里直接置 Finished —— Runner 仍需收到无输入的 Finish
+            // 命令，以便记录完成状态并退出循环。
             Completion::FormationBound => self.phase = Phase::Stepping,
             Completion::ActionExecuted => {
                 // 只有真正会向游戏发输入的动作才可能触发选中/拖拽慢放。
@@ -766,11 +760,10 @@ mod tests {
     }
 
     fn confirm_runtime_pause(m: &mut Machine, frame_id: u64, elapsed: i64) {
-        assert_eq!(m.phase(), Phase::ConfirmingPause);
         assert!(matches!(m.next_command(), Command::AwaitFrame { .. }));
         assert!(m.observe(&view(frame_id, elapsed, true)));
-        assert_eq!(m.phase(), Phase::Stepping);
-        assert!(m.is_paused());
+        assert!(!m.pause_in_flight);
+        assert!(m.paused);
     }
 
     #[test]
@@ -806,56 +799,9 @@ mod tests {
         assert_eq!(m.next_command(), Command::Pause);
         m.completed(Completion::PauseSent);
         confirm_runtime_pause(&mut m, 12, 60 - FRAME_LEAD);
+        assert_eq!(m.phase(), Phase::Stepping);
 
         // 之后就是逐帧脉冲
-        assert!(matches!(m.next_command(), Command::Pulse { .. }));
-    }
-
-    #[test]
-    fn missed_runtime_pause_never_allows_a_blind_pulse() {
-        let mut m = machine_at_zero();
-        m.completed(Completion::ActionExecuted);
-        m.completed(Completion::ResumeSent);
-        m.observe(&view(10, 52, false));
-        assert_eq!(m.next_command(), Command::Pause);
-        m.completed(Completion::PauseSent);
-
-        // A missed pause must not turn the one-second dwell into a blind pulse.
-        assert!(matches!(m.next_command(), Command::AwaitFrame { .. }));
-        for frame_id in 11_u64..=40 {
-            m.observe(&view(frame_id, 52 + (frame_id - 10) as i64, false));
-            if m.phase() == Phase::Aborted {
-                break;
-            }
-            assert!(matches!(
-                m.next_command(),
-                Command::AwaitFrame { .. } | Command::Pause
-            ));
-        }
-        assert_eq!(m.phase(), Phase::Aborted);
-        assert!(matches!(
-            m.abort_reason(),
-            Some(AbortReason::OvershotTarget { .. })
-        ));
-    }
-
-    #[test]
-    fn runtime_pause_retries_before_the_target_is_lost() {
-        let mut m = machine_at_zero();
-        m.completed(Completion::ActionExecuted);
-        m.completed(Completion::ResumeSent);
-        m.observe(&view(10, 52, false));
-        m.completed(Completion::PauseSent);
-
-        for frame_id in 11_u64..=14 {
-            m.observe(&view(frame_id, 52 + (frame_id - 10) as i64, false));
-        }
-        assert_eq!(m.cursor(), 56);
-        assert_eq!(m.phase(), Phase::Stepping);
-        assert_eq!(m.next_command(), Command::Pause);
-
-        m.completed(Completion::PauseSent);
-        confirm_runtime_pause(&mut m, 15, 56);
         assert!(matches!(m.next_command(), Command::Pulse { .. }));
     }
 
@@ -914,6 +860,90 @@ mod tests {
         }
         assert_eq!(m.cursor(), 60);
         assert_eq!(m.next_command(), Command::Execute { index: 1 });
+    }
+
+    #[test]
+    fn pulse_running_transition_waits_for_the_final_paused_sample() {
+        let mut m = machine_at_zero();
+        m.completed(Completion::ActionExecuted);
+        m.completed(Completion::ResumeSent);
+        m.observe(&view(10, 55, false));
+        assert_eq!(m.next_command(), Command::Pause);
+        m.completed(Completion::PauseSent);
+        confirm_runtime_pause(&mut m, 11, 55);
+
+        assert!(matches!(m.next_command(), Command::Pulse { .. }));
+        m.completed(Completion::PulseSent);
+
+        // 脉冲顺序是 ESC → pauseBattle，尺子可能先看到前半段的运行态。
+        m.observe(&view(12, 56, false));
+        assert_eq!(m.tuner().pulses, 0, "中间态不能提前结算脉冲");
+        assert!(
+            matches!(m.next_command(), Command::AwaitFrame { .. }),
+            "脉冲中间态不能补发 Pause，否则会把游戏再次切回运行"
+        );
+
+        m.observe(&view(13, 56, true));
+        assert_eq!(m.tuner().pulses, 1, "最终暂停态才结算一次脉冲");
+        assert!(matches!(m.next_command(), Command::Pulse { .. }));
+    }
+
+    #[test]
+    fn runtime_pause_must_be_confirmed_before_the_first_pulse() {
+        let mut m = machine_at_zero();
+        m.completed(Completion::ActionExecuted);
+        m.completed(Completion::ResumeSent);
+        m.observe(&view(10, 55, false));
+        assert_eq!(m.next_command(), Command::Pause);
+        m.completed(Completion::PauseSent);
+
+        assert!(
+            matches!(m.next_command(), Command::AwaitFrame { .. }),
+            "发送 Pause 不等于游戏已经暂停，不能直接进入 1 秒等待和脉冲"
+        );
+        m.observe(&view(11, 55, true));
+        assert!(matches!(m.next_command(), Command::Pulse { .. }));
+    }
+
+    #[test]
+    fn missed_runtime_pause_aborts_before_the_one_second_dwell() {
+        let mut m = machine_at_zero();
+        m.completed(Completion::ActionExecuted);
+        m.completed(Completion::ResumeSent);
+        m.observe(&view(10, 52, false));
+        assert_eq!(m.next_command(), Command::Pause);
+        m.completed(Completion::PauseSent);
+
+        for frame_id in 11_u64..=14 {
+            m.observe(&view(frame_id, 52 + (frame_id - 10) as i64, false));
+        }
+        assert_eq!(m.cursor(), 56);
+        assert_eq!(m.phase(), Phase::Aborted);
+        assert!(matches!(
+            m.abort_reason(),
+            Some(AbortReason::PauseIneffective)
+        ));
+    }
+
+    #[test]
+    fn pulse_that_never_returns_to_paused_aborts_boundedly() {
+        let mut m = machine_at_zero();
+        m.completed(Completion::ActionExecuted);
+        m.completed(Completion::ResumeSent);
+        m.observe(&view(10, 55, false));
+        m.completed(Completion::PauseSent);
+        confirm_runtime_pause(&mut m, 11, 55);
+        assert!(matches!(m.next_command(), Command::Pulse { .. }));
+        m.completed(Completion::PulseSent);
+
+        for i in 0..PULSE_SETTLE_SAMPLE_LIMIT {
+            m.observe(&view(12 + u64::from(i), 56, false));
+        }
+        assert_eq!(m.phase(), Phase::Aborted);
+        assert!(matches!(
+            m.abort_reason(),
+            Some(AbortReason::PulseDidNotSettle { .. })
+        ));
     }
 
     #[test]
@@ -1225,30 +1255,33 @@ mod tests {
         // 同一帧的第二个动作：不该插入任何脉冲或恢复
         assert_eq!(m.next_command(), Command::Execute { index: 1 });
         m.completed(Completion::ActionExecuted);
-        assert_eq!(
-            m.next_command(),
-            Command::Finish { resume: true },
-            "全部做完应当收尾"
-        );
+        assert_eq!(m.next_command(), Command::Finish);
     }
 
     #[test]
-    fn after_last_action_pause_keeps_the_game_frozen() {
-        let job = JOB.replace(
-            r#""after_last_action": "resume""#,
-            r#""after_last_action": "pause""#,
-        );
-        let mut m = Machine::new(Copilot::parse(&job).unwrap());
+    fn final_action_finishes_immediately_without_any_follow_up_input() {
+        let job = r#"{
+            "stage_name": "1-7",
+            "frame_replicator": {"after_last_action":"resume"},
+            "opers": [{"name":"山"}],
+            "actions": [
+                {"type":"Deploy","frame":0,"name":"山","location":[3,2]}
+            ]
+        }"#;
+        let mut m = Machine::new(Copilot::parse(job).unwrap());
         m.start();
         m.observe(&view(1, 0, false));
         m.completed(Completion::PauseSent);
         m.observe(&view(2, 0, true));
         m.completed(Completion::FormationBound);
-        for _ in 0..3 {
-            m.completed(Completion::ActionExecuted);
-        }
-        assert_eq!(m.next_command(), Command::Finish { resume: false });
-        assert_eq!(m.phase(), Phase::Finished);
+
+        assert_eq!(m.next_command(), Command::Execute { index: 0 });
+        m.completed(Completion::ActionExecuted);
+        assert_eq!(
+            m.next_command(),
+            Command::Finish,
+            "最后一个动作已经给出最终输入，之后必须直接结束，不能再等帧、暂停或恢复"
+        );
     }
 
     #[test]
