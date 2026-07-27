@@ -66,6 +66,8 @@ pub enum Phase {
     WaitingBattle,
     /// 已发出开局暂停，等一条可信的暂停态样本来确认。
     ConfirmingZero,
+    /// 已发出运行期暂停，等待尺子确认游戏已暂停。
+    ConfirmingPause,
     /// 编队匹配（用户把作业干员和部署栏卡片对上）。
     BindingFormation,
     /// 正常运行，等着接近目标帧。
@@ -86,6 +88,7 @@ impl Phase {
             Self::Idle => "空闲",
             Self::WaitingBattle => "等待开局",
             Self::ConfirmingZero => "确认开局暂停",
+            Self::ConfirmingPause => "确认暂停",
             Self::BindingFormation => "编队匹配",
             Self::Cruising => "正常运行",
             Self::Stepping => "逐帧推进",
@@ -127,7 +130,7 @@ pub enum Command {
 /// 调用方对一条命令的回报。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Completion {
-    /// 已发出开局暂停键。
+    /// 已发出暂停键，等待尺子确认。
     PauseSent,
     /// 已发出恢复键。
     ResumeSent,
@@ -220,6 +223,10 @@ pub struct Machine {
     action_index: usize,
     /// 游戏当前是否被我们停住了。
     paused: bool,
+    /// 运行期暂停键已经发出，但还没有收到尺子的暂停确认。
+    pause_pending: bool,
+    /// 当前接近目标帧的暂停请求已经重试了多少次。
+    pause_attempts: u8,
     /// 已消费到的最新 `frame_id`。
     last_frame_id: u64,
     /// 刚发过一次脉冲，等着看它推进了几帧。
@@ -242,6 +249,12 @@ pub struct Machine {
 /// 也能在半秒内识破真正的暂停失效（代理指挥 / 托管会一直涨下去）。
 const PAUSE_PROBE_LIMIT: u32 = 8;
 
+/// 接近动作目标时的运行期暂停确认窗口要短于开场窗口，给重试留下安全帧余量。
+const RUNTIME_PAUSE_PROBE_LIMIT: u32 = 4;
+
+/// 单次暂停确认失败后允许重新发送的次数。
+const PAUSE_RETRY_LIMIT: u8 = 2;
+
 /// 动作注入完成后，允许尺子短暂报告 0.2x 的新样本数。
 ///
 /// Skill / Retreat 的暂停态选中流程会让游戏经过一小段 0.2x_running /
@@ -260,6 +273,8 @@ impl Machine {
             origin: 0,
             action_index: 0,
             paused: false,
+            pause_pending: false,
+            pause_attempts: 0,
             last_frame_id: 0,
             pulse_in_flight: false,
             pulse_from: 0,
@@ -283,6 +298,11 @@ impl Machine {
 
     pub fn phase(&self) -> Phase {
         self.phase
+    }
+
+    /// 返回最近一条可信尺子样本确认的暂停状态。
+    pub fn is_paused(&self) -> bool {
+        self.paused
     }
 
     pub fn cursor(&self) -> i64 {
@@ -412,7 +432,9 @@ impl Machine {
         match self.phase {
             Phase::WaitingBattle => self.observe_waiting(view),
             Phase::ConfirmingZero => self.observe_confirming(view),
-            Phase::Cruising | Phase::Stepping => self.observe_running(view),
+            Phase::Cruising | Phase::Stepping | Phase::ConfirmingPause => {
+                self.observe_running(view)
+            }
             _ => {}
         }
         true
@@ -434,6 +456,8 @@ impl Machine {
         self.cursor = view.elapsed;
         if view.paused == Some(true) {
             self.pause_probe = None;
+            self.pause_pending = false;
+            self.pause_attempts = 0;
             self.paused = true;
             self.origin = view.elapsed;
 
@@ -493,6 +517,44 @@ impl Machine {
             });
             return;
         }
+
+        if self.pause_pending {
+            if view.paused == Some(true) {
+                self.pause_pending = false;
+                self.pause_probe = None;
+                self.pause_attempts = 0;
+                self.paused = true;
+                self.phase = Phase::Stepping;
+                return;
+            }
+
+            self.paused = false;
+            if let Some((from, count)) = self.pause_probe {
+                if self.cursor > from {
+                    let count = count + 1;
+                    if count >= RUNTIME_PAUSE_PROBE_LIMIT {
+                        if self.pause_attempts < PAUSE_RETRY_LIMIT {
+                            self.pause_attempts += 1;
+                            self.pause_pending = false;
+                            self.pause_probe = None;
+                            self.phase = Phase::Stepping;
+                            log::warn!(
+                                "pause confirmation failed; retrying ({}/{}) at frame {}",
+                                self.pause_attempts,
+                                PAUSE_RETRY_LIMIT,
+                                self.cursor,
+                            );
+                        } else {
+                            self.fail(AbortReason::PauseIneffective);
+                        }
+                    } else {
+                        self.pause_probe = Some((self.cursor, count));
+                    }
+                }
+            }
+            return;
+        }
+
         if let Some(paused) = view.paused {
             self.paused = paused;
         }
@@ -517,6 +579,9 @@ impl Machine {
             Phase::ConfirmingZero => Command::AwaitFrame {
                 timeout: AWAIT_TIMEOUT,
             },
+            Phase::ConfirmingPause => Command::AwaitFrame {
+                timeout: AWAIT_TIMEOUT,
+            },
 
             Phase::BindingFormation => Command::BindFormation,
 
@@ -533,6 +598,12 @@ impl Machine {
         };
 
         let remaining = target - self.cursor;
+
+        if self.pause_pending {
+            return Command::AwaitFrame {
+                timeout: AWAIT_TIMEOUT,
+            };
+        }
 
         // 已经到点了：确保处于暂停态，然后注入。
         if remaining == 0 {
@@ -570,9 +641,6 @@ impl Machine {
                 timeout: AWAIT_TIMEOUT,
             };
         }
-        self.pulse_in_flight = true;
-        self.pulse_from = self.cursor;
-
         // 最后一步是唯一致命的一步：这里 +2 就直接越过目标、整场作废
         // （更早的 +2 只是离目标更近，无害；remaining==2 时 +2 甚至正好落在目标上）。
         // 实测推进量几乎不随 gap 变化，但脉冲的解暂停窗口 ∝ gap ——
@@ -593,13 +661,23 @@ impl Machine {
                     self.phase = Phase::ConfirmingZero;
                     self.pause_probe = None;
                 } else {
-                    // 运行中的提前暂停：先乐观地认为生效了，
-                    // 下一条快照会纠正（暂停后帧数不再增长）。
-                    self.paused = true;
+                    // 运行期暂停必须等尺子确认，不能把按键发送成功当成游戏已暂停。
+                    self.paused = false;
+                    self.pause_pending = true;
+                    self.pause_probe = Some((self.cursor, 0));
+                    self.phase = Phase::ConfirmingPause;
                 }
             }
-            Completion::ResumeSent => self.paused = false,
-            Completion::PulseSent => {}
+            Completion::ResumeSent => {
+                self.paused = false;
+                self.pause_pending = false;
+                self.pause_probe = None;
+                self.pause_attempts = 0;
+            }
+            Completion::PulseSent => {
+                self.pulse_in_flight = true;
+                self.pulse_from = self.cursor;
+            }
             // 这两个都回到推进逻辑，由 next_running_command 决定下一步：
             // 同帧还有动作就接着注入，帧号更大就巡航/推进，没动作了就收尾。
             // 注意**不要**在这里直接置 Finished —— 那样 Finish 命令就发不出去了，
@@ -687,6 +765,14 @@ mod tests {
         m
     }
 
+    fn confirm_runtime_pause(m: &mut Machine, frame_id: u64, elapsed: i64) {
+        assert_eq!(m.phase(), Phase::ConfirmingPause);
+        assert!(matches!(m.next_command(), Command::AwaitFrame { .. }));
+        assert!(m.observe(&view(frame_id, elapsed, true)));
+        assert_eq!(m.phase(), Phase::Stepping);
+        assert!(m.is_paused());
+    }
+
     #[test]
     fn happy_path_reaches_frame_zero_and_injects_immediately() {
         let mut m = machine_at_zero();
@@ -719,9 +805,57 @@ mod tests {
         m.observe(&view(11, 60 - FRAME_LEAD, false));
         assert_eq!(m.next_command(), Command::Pause);
         m.completed(Completion::PauseSent);
-        assert_eq!(m.phase(), Phase::Stepping);
+        confirm_runtime_pause(&mut m, 12, 60 - FRAME_LEAD);
 
         // 之后就是逐帧脉冲
+        assert!(matches!(m.next_command(), Command::Pulse { .. }));
+    }
+
+    #[test]
+    fn missed_runtime_pause_never_allows_a_blind_pulse() {
+        let mut m = machine_at_zero();
+        m.completed(Completion::ActionExecuted);
+        m.completed(Completion::ResumeSent);
+        m.observe(&view(10, 52, false));
+        assert_eq!(m.next_command(), Command::Pause);
+        m.completed(Completion::PauseSent);
+
+        // A missed pause must not turn the one-second dwell into a blind pulse.
+        assert!(matches!(m.next_command(), Command::AwaitFrame { .. }));
+        for frame_id in 11_u64..=40 {
+            m.observe(&view(frame_id, 52 + (frame_id - 10) as i64, false));
+            if m.phase() == Phase::Aborted {
+                break;
+            }
+            assert!(matches!(
+                m.next_command(),
+                Command::AwaitFrame { .. } | Command::Pause
+            ));
+        }
+        assert_eq!(m.phase(), Phase::Aborted);
+        assert!(matches!(
+            m.abort_reason(),
+            Some(AbortReason::OvershotTarget { .. })
+        ));
+    }
+
+    #[test]
+    fn runtime_pause_retries_before_the_target_is_lost() {
+        let mut m = machine_at_zero();
+        m.completed(Completion::ActionExecuted);
+        m.completed(Completion::ResumeSent);
+        m.observe(&view(10, 52, false));
+        m.completed(Completion::PauseSent);
+
+        for frame_id in 11_u64..=14 {
+            m.observe(&view(frame_id, 52 + (frame_id - 10) as i64, false));
+        }
+        assert_eq!(m.cursor(), 56);
+        assert_eq!(m.phase(), Phase::Stepping);
+        assert_eq!(m.next_command(), Command::Pause);
+
+        m.completed(Completion::PauseSent);
+        confirm_runtime_pause(&mut m, 15, 56);
         assert!(matches!(m.next_command(), Command::Pulse { .. }));
     }
 
@@ -734,6 +868,7 @@ mod tests {
         m.completed(Completion::ResumeSent);
         m.observe(&view(10, 58, false)); // remaining = 2
         m.completed(Completion::PauseSent);
+        confirm_runtime_pause(&mut m, 11, 58);
 
         let Command::Pulse { gap } = m.next_command() else {
             panic!("应当发脉冲");
@@ -744,7 +879,7 @@ mod tests {
             "remaining=2 时用整定器的 gap"
         );
         m.completed(Completion::PulseSent);
-        m.observe(&view(11, 59, true)); // remaining = 1
+        m.observe(&view(12, 59, true)); // remaining = 1
 
         let Command::Pulse { gap } = m.next_command() else {
             panic!("应当发脉冲");
@@ -764,8 +899,9 @@ mod tests {
         m.observe(&view(10, 55, false)); // 距目标 5 帧，进入提前暂停区间
         assert_eq!(m.next_command(), Command::Pause);
         m.completed(Completion::PauseSent);
+        confirm_runtime_pause(&mut m, 11, 55);
 
-        let mut frame_id = 11;
+        let mut frame_id = 12;
         for elapsed in 56..=60 {
             let cmd = m.next_command();
             assert!(
@@ -787,12 +923,13 @@ mod tests {
         m.completed(Completion::ResumeSent);
         m.observe(&view(10, 58, false));
         m.completed(Completion::PauseSent);
+        confirm_runtime_pause(&mut m, 11, 58);
 
         // 连发三次脉冲但帧数纹丝不动 —— 必须继续重试，而不是中止。
         // 实测空脉冲率约 42%，连着几次是常态；间隔也不该因此漂移
         // （实测证明加大间隔对推进量没有帮助，只增加跨帧风险）。
         let gap_before = m.tuner().gap_ms();
-        let mut frame_id = 11;
+        let mut frame_id = 12;
         for _ in 0..3 {
             assert!(matches!(m.next_command(), Command::Pulse { .. }));
             m.completed(Completion::PulseSent);
@@ -824,11 +961,12 @@ mod tests {
         m.completed(Completion::ResumeSent);
         m.observe(&view(10, 59, false));
         m.completed(Completion::PauseSent);
+        confirm_runtime_pause(&mut m, 11, 59);
         assert!(matches!(m.next_command(), Command::Pulse { .. }));
         m.completed(Completion::PulseSent);
 
         // 一发脉冲跨了两帧，直接越过 60
-        m.observe(&view(11, 61, true));
+        m.observe(&view(12, 61, true));
         assert_eq!(m.phase(), Phase::Aborted);
         assert!(matches!(
             m.abort_reason(),
@@ -848,19 +986,20 @@ mod tests {
         m.completed(Completion::ResumeSent);
         m.observe(&view(10, 55, false));
         m.completed(Completion::PauseSent);
+        confirm_runtime_pause(&mut m, 11, 55);
         assert!(matches!(m.next_command(), Command::Pulse { .. }));
         m.completed(Completion::PulseSent);
 
         // 光标遮挡：elapsed 停在旧值且不可信。若被当成"没推进"，
         // 整定器会误加间隔，最终导致跨帧。
-        let mut blocked = view(11, 55, true);
+        let mut blocked = view(12, 55, true);
         blocked.trustworthy = false;
         assert!(!m.observe(&blocked), "不可信样本必须被丢弃");
         assert_eq!(m.tuner().pulses, 0, "不可信样本不该喂给整定器");
         assert_eq!(m.cursor(), 55);
 
         // 恢复正常后才计数
-        m.observe(&view(12, 56, true));
+        m.observe(&view(13, 56, true));
         assert_eq!(m.tuner().pulses, 1);
         assert_eq!(m.cursor(), 56);
     }

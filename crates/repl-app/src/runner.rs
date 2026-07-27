@@ -171,8 +171,20 @@ impl<'a> Runner<'a> {
                     // 逐帧推进阶段：每次脉冲前先等 SLOW_STEP_PAUSE。
                     // 这给游戏和尺子充足的稳定时间，避免在状态未稳定时解暂停
                     // （选中 UI 动画、费用条抖动等都会在这里安全地结束）。
-                    if self.machine.phase() == Phase::Stepping {
-                        precise_sleep(SLOW_STEP_PAUSE);
+                    let gap = if self.machine.phase() == Phase::Stepping {
+                        if !self.stabilize_pause(SLOW_STEP_PAUSE)? {
+                            continue;
+                        }
+                        // 稳定窗口可能消费了最后一帧，重新计算间隔。
+                        let Command::Pulse { gap } = self.machine.next_command() else {
+                            continue;
+                        };
+                        gap
+                    } else {
+                        gap
+                    };
+                    if self.machine.phase() != Phase::Stepping || !self.machine.is_paused() {
+                        continue;
                     }
                     self.session.pause.pulse(gap)?;
                     self.machine.completed(Completion::PulseSent);
@@ -359,6 +371,46 @@ impl<'a> Runner<'a> {
             }
         }
         Err(anyhow!("等待开局超时（5 分钟）"))
+    }
+
+    /// 在脉冲前的稳定窗口内保持暂停，并持续消费新的尺子样本。
+    /// 如果暂停丢失，取消当前脉冲，让状态机重新请求暂停。
+    fn stabilize_pause(&mut self, duration: Duration) -> Result<bool> {
+        let deadline = Instant::now() + duration;
+        while Instant::now() < deadline {
+            if self.cancel.load(Ordering::Relaxed) {
+                self.machine.user_abort();
+                return Ok(false);
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.frames.wait_next(
+                self.machine.last_frame_id(),
+                remaining.min(Duration::from_millis(100)),
+            ) {
+                Ok(snapshot) => {
+                    let view = to_view(&snapshot);
+                    let accepted = self.machine.observe(&view);
+                    if self.machine.phase() == Phase::Aborted {
+                        return Err(anyhow!(
+                            "{}",
+                            self.machine
+                                .abort_reason()
+                                .expect("aborted machine has a reason")
+                        ));
+                    }
+                    if (accepted && !self.machine.is_paused())
+                        || (view.trustworthy && view.paused == Some(false))
+                    {
+                        self.note("脉冲前检测到暂停已丢失，取消本次脉冲并重新确认".into());
+                        return Ok(false);
+                    }
+                }
+                Err(FrameError::Timeout(_)) => {}
+                Err(e) => return Err(anyhow!("{e}")),
+            }
+        }
+        Ok(self.machine.is_paused())
     }
 
     /// 等一条新的、可信的尺子样本。
