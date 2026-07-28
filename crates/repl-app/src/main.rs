@@ -42,7 +42,7 @@ fn main() -> Result<(), slint::PlatformError> {
         .and_then(|p| p.parent().map(|d| d.join("replicator.log")))
         .unwrap_or_else(|| std::path::PathBuf::from("replicator.log"));
     // repl_app 开 debug：被拒样本的逐条记录只在 debug 级，出问题时全靠它定位。
-    repl_app::init_to_file("info,repl_app=debug", &log_path);
+    repl_app::init_to_file("info,repl_app=debug,repl_core::machine=debug", &log_path);
 
     let config = Rc::new(RefCell::new(Config::load()));
     let ui = MainWindow::new()?;
@@ -51,6 +51,8 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.set_actions(ModelRc::new(VecModel::<ActionRow>::default()));
     ui.set_cards(ModelRc::new(VecModel::<CardRow>::default()));
     ui.set_unbound_opers(ModelRc::new(VecModel::<SharedString>::default()));
+    ui.set_afa_ready(false);
+    ui.set_afa_detail("未检测".into());
 
     let ruler = Arc::new(RulerClient::connect(config.borrow().ruler_ws_url.clone()));
     let copilot: Rc<RefCell<Option<Copilot>>> = Rc::new(RefCell::new(None));
@@ -177,6 +179,16 @@ fn main() -> Result<(), slint::PlatformError> {
                 ui.set_status_line("请先装载作业".into());
                 return;
             };
+            let afa = repl_input::AfaController::probe();
+            if !afa.ready {
+                ui.set_status_line(format!("AFA 未就绪：{}", afa.detail).into());
+                append_log(
+                    &ui,
+                    &log,
+                    &format!("开始被拒绝：AFA 未就绪：{}", afa.detail),
+                );
+                return;
+            }
             cancel.store(false, Ordering::Relaxed);
             ui.set_running(true);
             ui.set_status_line("正在准备…".into());
@@ -235,6 +247,7 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let ui_weak = ui.as_weak();
         let ruler = Arc::clone(&ruler);
+        let copilot = Rc::clone(&copilot);
         let timer = slint::Timer::default();
         // 管线停滞检测：frameId 长时间不涨 = 尺子没在分析新画面。
         // 注意静止画面（菜单挂机）下 WGC 不产帧、frameId 停住是正常的，
@@ -246,6 +259,14 @@ fn main() -> Result<(), slint::PlatformError> {
             move || {
                 let Some(ui) = ui_weak.upgrade() else { return };
                 ui.set_ruler_connected(ruler.status().is_connected());
+                let afa = repl_input::AfaController::probe();
+                ui.set_afa_ready(afa.ready);
+                ui.set_afa_detail(afa.detail.into());
+                if !afa.ready {
+                    ui.set_can_start(false);
+                } else if !ui.get_running() && copilot.borrow().is_some() {
+                    ui.set_can_start(true);
+                }
                 if let Some(snapshot) = ruler.latest() {
                     ui.set_ruler_profile(
                         snapshot
@@ -275,9 +296,9 @@ fn main() -> Result<(), slint::PlatformError> {
                     } else {
                         ui.set_battle_state(snapshot.battle_state_str().into());
                     }
-                    if !ui.get_running() {
-                        ui.set_cursor_frame(snapshot.total_elapsed_frames as i32);
-                    }
+                    // 绝对帧始终以尺子为准。运行期间 Machine 的游标可能在动作注入或
+                    // 确认屏障中暂时落后，不能用它覆盖尺子的最新读数。
+                    ui.set_cursor_frame(snapshot.total_elapsed_frames as i32);
                 }
                 ui.set_game_found(repl_capture::GameWindow::find().is_ok());
             },
@@ -426,11 +447,10 @@ fn pump_progress(
                 match event {
                     Progress::Phase {
                         phase,
-                        cursor,
+                        cursor: _,
                         target,
                     } => {
                         ui.set_phase(phase.zh().into());
-                        ui.set_cursor_frame(cursor as i32);
                         ui.set_target_frame(target.map_or(-1, |t| t as i32));
                     }
                     Progress::NeedsBinding { cards, opers } => {
@@ -456,7 +476,9 @@ fn pump_progress(
                     }
                     Progress::ActionStarted { index, frame } => {
                         set_row_status(&ui, index, 1);
-                        ui.set_status_line(format!("第 {frame} 帧：正在注入动作 #{index}").into());
+                        ui.set_status_line(
+                            format!("第 {frame} 帧：正在派发并等待动作 #{index} 确认").into(),
+                        );
                     }
                     Progress::ActionDone { index } => set_row_status(&ui, index, 2),
                     Progress::Log(line) => append_log(&ui, &log, &line),

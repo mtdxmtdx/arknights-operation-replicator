@@ -22,6 +22,9 @@ slint.workspace = true
 [build-dependencies]
 slint-build.workspace = true
 
+[dev-dependencies]
+repl-frames = { workspace = true, features = ["test-util"] }
+
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
     "Win32_Globalization",

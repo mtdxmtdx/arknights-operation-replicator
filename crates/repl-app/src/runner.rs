@@ -17,7 +17,7 @@ use std::{
 use anyhow::{anyhow, Result};
 use repl_core::{
     machine::{AbortReason, Command, Completion, FrameView, Machine, Phase},
-    Action, Copilot,
+    ActionType, Copilot,
 };
 use repl_frames::{FrameError, FrameSource, Snapshot};
 use repl_input::{precise_sleep, TimerResolution};
@@ -81,6 +81,15 @@ const SLOW_STEP_PAUSE: Duration = Duration::from_millis(1000);
 ///
 /// 给游戏时间确认"已暂停、已停在目标帧"的状态，再开始触控和键盘注入。
 const PRE_ACTION_PAUSE: Duration = Duration::from_secs(2);
+
+/// AFA 委托或部署动作发出后，等待尺子确认动作仍停在目标帧的上限。
+const ACTION_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// AFA 自动开局暂停被尺子确认后，开始编队和后续动作前的稳定等待。
+const OPENING_PAUSE_SETTLE: Duration = Duration::from_secs(1);
+
+/// 编队绑定面板关闭后，等待用户把游戏恢复到前台的上限。
+const GAME_FOCUS_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// 一次复刻运行。
 pub struct Runner<'a> {
@@ -156,12 +165,22 @@ impl<'a> Runner<'a> {
                 Command::ArmBattleStart => self.arm_battle_start()?,
 
                 Command::Pause => {
-                    self.session.pause.pause()?;
+                    log::info!(
+                        "dispatching AFA runtime pause: cursor={} target={:?}",
+                        self.machine.cursor(),
+                        self.machine.target()
+                    );
+                    self.session.pause_battle()?;
                     self.machine.completed(Completion::PauseSent);
                 }
 
                 Command::Resume => {
-                    self.session.pause.resume()?;
+                    log::info!(
+                        "dispatching AFA runtime resume: cursor={} target={:?}",
+                        self.machine.cursor(),
+                        self.machine.target()
+                    );
+                    self.session.resume_battle()?;
                     self.machine.completed(Completion::ResumeSent);
                 }
 
@@ -172,11 +191,18 @@ impl<'a> Runner<'a> {
                     if self.machine.phase() == Phase::Stepping {
                         precise_sleep(SLOW_STEP_PAUSE);
                     }
-                    self.session.pause.pulse(gap)?;
+                    self.session.pulse(gap)?;
                     self.machine.completed(Completion::PulseSent);
                 }
 
-                Command::AwaitFrame { timeout } => self.await_frame(timeout)?,
+                Command::AwaitFrame { timeout } => {
+                    let confirming_opening_pause = self.machine.phase() == Phase::ConfirmingZero;
+                    self.await_frame(timeout)?;
+                    if confirming_opening_pause && self.machine.phase() == Phase::BindingFormation {
+                        self.note("AFA 开局暂停已确认，等待 1 秒后继续后续操作".into());
+                        precise_sleep(OPENING_PAUSE_SETTLE);
+                    }
+                }
 
                 Command::BindFormation => {
                     // NeedsBinding 事件由 binder 自己发（只有它知道扫出了哪些卡片）。
@@ -184,6 +210,7 @@ impl<'a> Runner<'a> {
                     if !done {
                         return Err(anyhow!("编队绑定未完成，复刻中止"));
                     }
+                    self.restore_game_foreground()?;
                     // 用户刚在我们的窗口里点过"确认"，鼠标位置不可控 ——
                     // 停回安全区，防止它落在费用条上把尺子的分析冻住。
                     self.session.park_cursor();
@@ -191,15 +218,52 @@ impl<'a> Runner<'a> {
                 }
 
                 Command::Execute { index } => {
-                    // 到达目标帧后，先稳定等待再注入，让游戏确认暂停状态。
-                    precise_sleep(PRE_ACTION_PAUSE);
                     let action = self.machine.copilot().actions[index].clone();
+                    // 到达目标帧后，在稳定等待期间持续读取尺子，而不是盲等后继续使用
+                    // Machine 的旧游标。尺子是绝对帧的唯一真源；若它已经越过目标帧，
+                    // 必须在任何鼠标或 AFA 输入发出前中止。
+                    let min_frame_id = match wait_for_action_dispatch_ready(
+                        self.frames,
+                        &self.cancel,
+                        action.frame,
+                        self.machine.last_frame_id(),
+                        PRE_ACTION_PAUSE,
+                        |frame_id| self.machine.acknowledge_frame_id(frame_id),
+                    ) {
+                        Ok(frame_id) => frame_id,
+                        Err(error) => {
+                            self.machine.execution_failed(error.to_string());
+                            return Err(error);
+                        }
+                    };
                     let _ = self.events.send(Progress::ActionStarted {
                         index,
                         frame: action.frame,
                     });
-                    match self.execute_action(&action) {
+                    let mut confirmation_min_frame_id = min_frame_id;
+                    let execution = {
+                        let frames = self.frames;
+                        let machine = &mut self.machine;
+                        self.session.execute(&action, || {
+                            confirmation_min_frame_id = verify_action_dispatch_now(
+                                frames,
+                                action.frame,
+                                confirmation_min_frame_id,
+                                |frame_id| machine.acknowledge_frame_id(frame_id),
+                            )?;
+                            Ok(())
+                        })
+                    };
+                    match execution {
                         Ok(()) => {
+                            if !matches!(action.kind, ActionType::Output) {
+                                if let Err(error) =
+                                    self.confirm_action(action.frame, confirmation_min_frame_id)
+                                {
+                                    self.machine.execution_failed(error.to_string());
+                                    return Err(error);
+                                }
+                            }
                             let _ = self.events.send(Progress::ActionDone { index });
                             self.machine.completed(Completion::ActionExecuted);
                         }
@@ -212,7 +276,7 @@ impl<'a> Runner<'a> {
 
                 Command::Finish => {
                     self.note(format!(
-                        "全部动作已注入（最后目标帧 {}），不再发送任何输入",
+                        "全部动作已确认（最后目标帧 {}），不再发送任何输入",
                         self.machine.cursor()
                     ));
                     return Ok(());
@@ -221,8 +285,46 @@ impl<'a> Runner<'a> {
         }
     }
 
-    fn execute_action(&mut self, action: &Action) -> Result<()> {
-        self.session.execute(action)
+    /// 绑定面板会短暂夺走前台。这里只尝试一次系统前台切换；失败后等待用户手动
+    /// 点击游戏，不在动作委托阶段偷偷抢焦点或重发热键。
+    fn restore_game_foreground(&mut self) -> Result<()> {
+        if self.session.window.is_foreground() {
+            return Ok(());
+        }
+        let _ = self.session.window.focus();
+        let deadline = Instant::now() + GAME_FOCUS_TIMEOUT;
+        while Instant::now() < deadline {
+            if self.cancel.load(Ordering::Relaxed) {
+                return Err(anyhow!("用户在等待游戏前台时中止复刻"));
+            }
+            if self.session.window.is_foreground() {
+                return Ok(());
+            }
+            precise_sleep(Duration::from_millis(100));
+        }
+        Err(anyhow!(
+            "编队绑定后游戏窗口仍不在前台；请点击游戏窗口后重新开始"
+        ))
+    }
+
+    /// 确认一次真实输入已经收尾：只接受动作派发后的新样本，且样本必须显示暂停。
+    ///
+    /// 注意 `Snapshot::is_running` 是尺子的费用条识别管线状态，不是战斗是否运行；
+    /// 这里用 `FrameView::paused == Some(false)` 判定游戏运行态。任何运行态样本
+    /// 都直接失败，不能把它当作“短暂过渡”而继续等，否则可能已经越过目标帧。
+    fn confirm_action(&mut self, action_frame: i64, min_frame_id: u64) -> Result<()> {
+        let (frame_id, view) = wait_for_action_confirmation(
+            self.frames,
+            &self.cancel,
+            action_frame,
+            min_frame_id,
+            |frame_id| self.machine.acknowledge_frame_id(frame_id),
+        )?;
+        self.note(format!(
+            "动作确认通过：frame_id={frame_id} state={} elapsed={action_frame}",
+            view.battle_state
+        ));
+        Ok(())
     }
 
     fn report_phase(&self) {
@@ -242,19 +344,8 @@ impl<'a> Runner<'a> {
         let _ = self.events.send(Progress::Log(message));
     }
 
-    /// 等待战斗开始，并在合适的时机发暂停。
-    ///
-    /// **暂停的唯一触发条件：尺子给出第一条可信的战斗内样本** ——
-    /// 即费用条已经被真正读到了。这一条同时排除了三类踩过的坑：
-    ///
-    /// 1. 像素触发在准备界面 / 加载画面上误开火（ESC 按了个寂寞，
-    ///    后面等"暂停态样本"全部落空 —— 实测发生过）；
-    /// 2. HUD 刚出现就暂停，但开局标题卡还盖着费用条：暂停把渐隐动画一起冻住，
-    ///    尺子永远读不到费用条；
-    /// 3. 尺子那头因为任何原因还没就绪，我们却已经把游戏停住了。
-    ///
-    /// 代价是暂停比 HUD 出现晚 2–4 个逻辑帧（尺子分析 + 我们的轮询延迟）——
-    /// 状态机本来就接受 `origin <= 首个动作帧`，示例作业首个动作在第 10 帧，兜得住。
+    /// 等待战斗开始。开局暂停完全由 AFA 的自动开局暂停负责；这里仅用尺子确认战斗与暂停状态，
+    /// 绝不发送开局暂停输入。像素检测只用于进度和尺子健康提示。
     ///
     /// 像素检测（倍速按钮区变白）降级为纯进度提示，不再驱动任何按键。
     fn arm_battle_start(&mut self) -> Result<()> {
@@ -292,7 +383,7 @@ impl<'a> Runner<'a> {
                     if speed_box_lit(&frame) {
                         let ruler_id = self.frames.latest().and_then(|s| s.frame_id).unwrap_or(0);
                         hud_seen = Some((Instant::now(), ruler_id));
-                        self.note("检测到战斗画面，等待尺子读到费用条后暂停…".into());
+                        self.note("检测到战斗画面，等待 AFA 自动开局暂停…".into());
                     }
                 }
             }
@@ -324,7 +415,7 @@ impl<'a> Runner<'a> {
                 }
             }
 
-            // 唯一的暂停触发：尺子的第一条可信战斗内样本。
+            // 只检测尺子的第一条可信战斗内样本；暂停输入完全由 AFA 自动开局暂停负责。
             // 用 wait_next（而不是 latest()）让尺子客户端进入主动轮询模式，
             // 不依赖"状态变化才推送"的语义。
             match self
@@ -339,13 +430,12 @@ impl<'a> Runner<'a> {
                     }
                     if accepted && view.in_battle {
                         log::info!(
-                            "battle start confirmed by ruler: state={} elapsed={} frame_id={}",
+                            "battle start detected by ruler; waiting for AFA automatic pause: state={} elapsed={} frame_id={}",
                             view.battle_state,
                             view.elapsed,
                             view.frame_id
                         );
-                        self.session.pause.pause()?;
-                        self.machine.completed(Completion::PauseSent);
+                        self.machine.completed(Completion::OpeningPauseDelegated);
                         // 用户刚点过"开始行动"，鼠标还停在按钮那儿；从现在起帧数
                         // 完全依赖尺子读费用条，必须立刻把鼠标挪去安全区。
                         self.session.park_cursor();
@@ -443,6 +533,242 @@ impl<'a> Runner<'a> {
     }
 }
 
+/// 在动作派发前用尺子完成稳定确认。
+///
+/// 与派发后的确认屏障不同，这里会覆盖完整的稳定等待时段：期间出现的每条新样本
+/// 都必须仍然允许在目标帧派发。最终只有尺子最新状态为可信 `1x_paused` 且绝对帧
+/// 等于目标帧时才返回；返回的 `frame_id` 同时成为派发后确认的新样本水位。
+fn wait_for_action_dispatch_ready<F>(
+    frames: &dyn FrameSource,
+    cancel: &AtomicBool,
+    action_frame: i64,
+    min_frame_id: u64,
+    settle: Duration,
+    mut on_new_sample: F,
+) -> Result<u64>
+where
+    F: FnMut(u64),
+{
+    let deadline = Instant::now() + settle;
+    let mut after_frame_id = min_frame_id;
+    let mut ready_frame_id = None;
+
+    if let Some(snapshot) = frames.latest() {
+        if let Some(frame_id) = snapshot.frame_id {
+            if frame_id > after_frame_id {
+                after_frame_id = frame_id;
+                on_new_sample(frame_id);
+            }
+            if frame_id >= min_frame_id {
+                let view = to_view(&snapshot);
+                ready_frame_id = classify_action_dispatch_sample(&view, action_frame)?;
+            }
+        }
+    }
+
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(anyhow!("用户在动作派发前停止复刻"));
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            // 截止瞬间再读取一次 latest，避免最后一次 wait_next 超时边界上刚好到达的
+            // 新样本没有参与派发判定。
+            if let Some(snapshot) = frames.latest() {
+                if let Some(frame_id) = snapshot.frame_id {
+                    if frame_id > after_frame_id {
+                        on_new_sample(frame_id);
+                    }
+                    if frame_id >= min_frame_id {
+                        let view = to_view(&snapshot);
+                        ready_frame_id = classify_action_dispatch_sample(&view, action_frame)?;
+                    }
+                }
+            }
+            return ready_frame_id.ok_or_else(|| {
+                anyhow!(
+                    "动作派发前尺子未确认目标帧 {action_frame} 的可信 1x_paused 状态（min_frame_id={min_frame_id}）"
+                )
+            });
+        }
+
+        match frames.wait_next(after_frame_id, remaining.min(Duration::from_millis(200))) {
+            Ok(snapshot) => {
+                let Some(frame_id) = snapshot.frame_id else {
+                    ready_frame_id = None;
+                    continue;
+                };
+                if frame_id <= after_frame_id {
+                    continue;
+                }
+                after_frame_id = frame_id;
+                on_new_sample(frame_id);
+                let view = to_view(&snapshot);
+                ready_frame_id = classify_action_dispatch_sample(&view, action_frame)?;
+            }
+            Err(FrameError::Timeout(_)) => continue,
+            Err(error) => return Err(anyhow!("动作派发前读取尺子失败：{error}")),
+        }
+    }
+}
+
+fn classify_action_dispatch_sample(view: &FrameView, action_frame: i64) -> Result<Option<u64>> {
+    match classify_action_sample(view, action_frame) {
+        ActionSampleDecision::Ignore => Ok(None),
+        ActionSampleDecision::Confirm => Ok(Some(view.frame_id)),
+        ActionSampleDecision::Reject(reason) => Err(anyhow!(
+            "动作派发前尺子状态不满足目标：{reason} frame_id={} state={} elapsed={}",
+            view.frame_id,
+            view.battle_state,
+            view.elapsed
+        )),
+    }
+}
+
+/// Session 完成识别、坐标计算等准备工作后，在首个实际动作输入前再次读取尺子。
+/// 这封住动作前稳定屏障与部署拖拽/AFA 热键之间的准备时间竞态。
+fn verify_action_dispatch_now<F>(
+    frames: &dyn FrameSource,
+    action_frame: i64,
+    min_frame_id: u64,
+    mut on_new_sample: F,
+) -> Result<u64>
+where
+    F: FnMut(u64),
+{
+    let snapshot = frames
+        .latest()
+        .ok_or_else(|| anyhow!("动作输入前尺子没有可用快照"))?;
+    let frame_id = snapshot
+        .frame_id
+        .ok_or_else(|| anyhow!("动作输入前尺子快照缺少 frame_id"))?;
+    if frame_id < min_frame_id {
+        return Err(anyhow!(
+            "动作输入前尺子快照倒退：frame_id={frame_id} min_frame_id={min_frame_id}"
+        ));
+    }
+    if frame_id > min_frame_id {
+        on_new_sample(frame_id);
+    }
+
+    let view = to_view(&snapshot);
+    classify_action_dispatch_sample(&view, action_frame)?.ok_or_else(|| {
+        anyhow!(
+            "动作输入前尺子尚未确认目标帧 {action_frame} 的可信 1x_paused 状态：frame_id={frame_id} state={} elapsed={}",
+            view.battle_state,
+            view.elapsed
+        )
+    })
+}
+
+/// 等待一条动作派发后的可信暂停样本。
+///
+/// `on_new_sample` 在每条新 `frame_id` 被分类前调用，让 Runner 继续推进 Machine 的
+/// 帧游标；传入回调也让这个循环可以在没有 Session/AFA 的单元测试中使用假帧源。
+fn wait_for_action_confirmation<F>(
+    frames: &dyn FrameSource,
+    cancel: &AtomicBool,
+    action_frame: i64,
+    min_frame_id: u64,
+    mut on_new_sample: F,
+) -> Result<(u64, FrameView)>
+where
+    F: FnMut(u64),
+{
+    let deadline = Instant::now() + ACTION_CONFIRM_TIMEOUT;
+    let mut after_frame_id = min_frame_id;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(anyhow!("用户在动作确认期间中止复刻"));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(anyhow!(
+                "动作确认超时：目标帧 {action_frame} 在派发后未收到新的暂停样本（min_frame_id={min_frame_id}）"
+            ));
+        }
+        match frames.wait_next(after_frame_id, remaining.min(Duration::from_millis(200))) {
+            Ok(snapshot) => {
+                let Some(frame_id) = snapshot.frame_id else {
+                    continue;
+                };
+                if frame_id <= after_frame_id {
+                    continue;
+                }
+                after_frame_id = frame_id;
+                on_new_sample(frame_id);
+                let view = to_view(&snapshot);
+
+                match classify_action_sample(&view, action_frame) {
+                    ActionSampleDecision::Ignore => continue,
+                    ActionSampleDecision::Confirm => return Ok((frame_id, view)),
+                    ActionSampleDecision::Reject(reason) => {
+                        return Err(anyhow!(
+                            "动作确认失败：{reason} frame_id={frame_id} state={} elapsed={}",
+                            view.battle_state,
+                            view.elapsed
+                        ));
+                    }
+                }
+            }
+            Err(FrameError::Timeout(_)) => continue,
+            Err(error) => return Err(anyhow!("动作确认读取尺子失败：{error}")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActionSampleDecision {
+    Ignore,
+    Confirm,
+    Reject(ActionRejectReason),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActionRejectReason {
+    Running,
+    LeftBattle,
+    WrongFrame,
+    NotOneX,
+}
+
+impl std::fmt::Display for ActionRejectReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Running => "观察到运行态",
+            Self::LeftBattle => "已离开战斗",
+            Self::WrongFrame => "绝对帧与目标不一致",
+            Self::NotOneX => "倍速不是 1x",
+        })
+    }
+}
+
+fn classify_action_sample(view: &FrameView, action_frame: i64) -> ActionSampleDecision {
+    // 运行态是不可恢复的确认失败：即使尺子当前读数不可信，也不能假设游戏没有推进。
+    if view.paused == Some(false) {
+        return ActionSampleDecision::Reject(ActionRejectReason::Running);
+    }
+    if !view.in_battle {
+        return ActionSampleDecision::Reject(ActionRejectReason::LeftBattle);
+    }
+    // deploying_operator / adjusting_operator_facing 的暂停状态未知，不能确认，
+    // 也不把它当成运行态；继续等待可判定的暂停样本。
+    if view.paused != Some(true) || !view.trustworthy {
+        return ActionSampleDecision::Ignore;
+    }
+    if view.elapsed != action_frame {
+        return ActionSampleDecision::Reject(ActionRejectReason::WrongFrame);
+    }
+    if view.battle_state == "0.2x_paused" {
+        return ActionSampleDecision::Ignore;
+    }
+    if !view.one_x {
+        return ActionSampleDecision::Reject(ActionRejectReason::NotOneX);
+    }
+    ActionSampleDecision::Confirm
+}
+
 /// 倍速按钮区域是否出现近白像素（AFA `SpeedButtonPositionColor` 的采样区）。
 ///
 /// 只是**粗筛**：准备界面 / 加载画面上的白色元素也会命中，必须再过
@@ -492,6 +818,7 @@ pub fn to_view(snapshot: &Snapshot) -> FrameView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use repl_frames::source::fake::FakeFrameSource;
 
     fn snapshot_json(state: &str, elapsed: i64, frame_id: u64, running: bool) -> Snapshot {
         serde_json::from_str(&format!(
@@ -552,5 +879,145 @@ mod tests {
         assert!(!v.in_battle);
         assert!(!v.one_x);
         assert_eq!(v.paused, None);
+    }
+
+    #[test]
+    fn action_confirmation_rejects_running_state_even_when_sample_is_untrusted() {
+        let view = to_view(&snapshot_json("1x_running", 60, 8, false));
+        assert_eq!(
+            classify_action_sample(&view, 60),
+            ActionSampleDecision::Reject(ActionRejectReason::Running)
+        );
+    }
+
+    #[test]
+    fn action_confirmation_tolerates_only_paused_point_two_transition() {
+        let view = to_view(&snapshot_json("0.2x_paused", 60, 8, true));
+        assert_eq!(
+            classify_action_sample(&view, 60),
+            ActionSampleDecision::Ignore
+        );
+    }
+
+    #[test]
+    fn action_confirmation_accepts_new_one_x_paused_target_sample() {
+        let view = to_view(&snapshot_json("1x_paused", 60, 8, true));
+        assert_eq!(
+            classify_action_sample(&view, 60),
+            ActionSampleDecision::Confirm
+        );
+    }
+
+    #[test]
+    fn action_confirmation_rejects_wrong_target_frame() {
+        let view = to_view(&snapshot_json("1x_paused", 61, 8, true));
+        assert_eq!(
+            classify_action_sample(&view, 60),
+            ActionSampleDecision::Reject(ActionRejectReason::WrongFrame)
+        );
+    }
+
+    #[test]
+    fn confirmation_loop_requires_new_sample_and_waits_through_point_two() {
+        let frames = FakeFrameSource::new([
+            // 与 min_frame_id 相同的样本必须被丢弃，不能成为确认依据。
+            snapshot_json("1x_paused", 60, 8, true),
+            snapshot_json("0.2x_paused", 60, 9, true),
+            snapshot_json("1x_paused", 60, 10, true),
+        ]);
+        let cancel = AtomicBool::new(false);
+        let mut seen = Vec::new();
+        let (frame_id, view) =
+            wait_for_action_confirmation(&frames, &cancel, 60, 8, |id| seen.push(id))
+                .expect("new 1x_paused target sample should confirm");
+
+        assert_eq!(seen, vec![9, 10]);
+        assert_eq!(frame_id, 10);
+        assert_eq!(view.battle_state, "1x_paused");
+    }
+
+    #[test]
+    fn confirmation_loop_rejects_running_sample_without_waiting() {
+        let frames = FakeFrameSource::new([snapshot_json("1x_running", 60, 9, true)]);
+        let cancel = AtomicBool::new(false);
+        let mut seen = Vec::new();
+        let error = wait_for_action_confirmation(&frames, &cancel, 60, 8, |id| seen.push(id))
+            .expect_err("running state must fail closed");
+
+        assert!(error.to_string().contains("观察到运行态"));
+        assert_eq!(seen, vec![9]);
+    }
+
+    #[test]
+    fn action_dispatch_preflight_rejects_ruler_frame_ahead_of_machine_cursor() {
+        let frames = FakeFrameSource::new([
+            snapshot_json("1x_paused", 10, 100, true),
+            snapshot_json("1x_paused", 11, 101, true),
+        ]);
+        let baseline = frames
+            .wait_next(0, Duration::from_millis(1))
+            .expect("prime the ruler snapshot at the machine cursor");
+        assert_eq!(baseline.total_elapsed_frames, 10);
+
+        let cancel = AtomicBool::new(false);
+        let mut seen = Vec::new();
+        let error = wait_for_action_dispatch_ready(
+            &frames,
+            &cancel,
+            10,
+            100,
+            Duration::from_millis(20),
+            |id| seen.push(id),
+        )
+        .expect_err("a newer authoritative ruler frame must block action dispatch");
+
+        assert!(error.to_string().contains("动作派发前"));
+        assert!(error.to_string().contains("elapsed=11"));
+        assert_eq!(seen, vec![101]);
+    }
+
+    #[test]
+    fn action_dispatch_preflight_accepts_current_authoritative_target_sample() {
+        let frames = FakeFrameSource::new([snapshot_json("1x_paused", 10, 100, true)]);
+        frames
+            .wait_next(0, Duration::from_millis(1))
+            .expect("prime the current ruler snapshot");
+
+        let cancel = AtomicBool::new(false);
+        let frame_id =
+            wait_for_action_dispatch_ready(&frames, &cancel, 10, 100, Duration::ZERO, |_| {})
+                .expect("the current authoritative target sample should permit dispatch");
+
+        assert_eq!(frame_id, 100);
+    }
+
+    #[test]
+    fn final_input_guard_rejects_frame_that_advanced_during_action_preparation() {
+        let frames = FakeFrameSource::new([
+            snapshot_json("1x_paused", 10, 100, true),
+            snapshot_json("1x_paused", 11, 101, true),
+        ]);
+        frames
+            .wait_next(0, Duration::from_millis(1))
+            .expect("prime the preflight target sample");
+        let preflight_frame_id = wait_for_action_dispatch_ready(
+            &frames,
+            &AtomicBool::new(false),
+            10,
+            100,
+            Duration::ZERO,
+            |_| {},
+        )
+        .expect("preflight should initially pass at frame 10");
+        frames
+            .wait_next(preflight_frame_id, Duration::from_millis(1))
+            .expect("advance the ruler while Session prepares the action");
+
+        let mut seen = Vec::new();
+        let error = verify_action_dispatch_now(&frames, 10, preflight_frame_id, |id| seen.push(id))
+            .expect_err("the last responsible input boundary must observe frame 11");
+
+        assert!(error.to_string().contains("elapsed=11"));
+        assert_eq!(seen, vec![101]);
     }
 }
