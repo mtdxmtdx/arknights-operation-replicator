@@ -42,7 +42,7 @@ fn main() -> Result<(), slint::PlatformError> {
         .and_then(|p| p.parent().map(|d| d.join("replicator.log")))
         .unwrap_or_else(|| std::path::PathBuf::from("replicator.log"));
     // repl_app 开 debug：被拒样本的逐条记录只在 debug 级，出问题时全靠它定位。
-    repl_app::init_to_file("info,repl_app=debug", &log_path);
+    repl_app::init_to_file("info,repl_app=debug,repl_core::machine=debug", &log_path);
 
     let config = Rc::new(RefCell::new(Config::load()));
     let ui = MainWindow::new()?;
@@ -296,9 +296,9 @@ fn main() -> Result<(), slint::PlatformError> {
                     } else {
                         ui.set_battle_state(snapshot.battle_state_str().into());
                     }
-                    if !ui.get_running() {
-                        ui.set_cursor_frame(snapshot.total_elapsed_frames as i32);
-                    }
+                    // 绝对帧始终以尺子为准。运行期间 Machine 的游标可能在动作注入或
+                    // 确认屏障中暂时落后，不能用它覆盖尺子的最新读数。
+                    ui.set_cursor_frame(snapshot.total_elapsed_frames as i32);
                 }
                 ui.set_game_found(repl_capture::GameWindow::find().is_ok());
             },
@@ -447,11 +447,10 @@ fn pump_progress(
                 match event {
                     Progress::Phase {
                         phase,
-                        cursor,
+                        cursor: _,
                         target,
                     } => {
                         ui.set_phase(phase.zh().into());
-                        ui.set_cursor_frame(cursor as i32);
                         ui.set_target_frame(target.map_or(-1, |t| t as i32));
                     }
                     Progress::NeedsBinding { cards, opers } => {

@@ -172,8 +172,11 @@ impl Session {
         names
     }
 
-    /// 执行一个动作。
-    pub fn execute(&mut self, action: &Action) -> Result<()> {
+    /// 执行一个动作。`before_input` 会在准备工作完成后、首个会影响游戏的输入前调用。
+    pub fn execute<F>(&mut self, action: &Action, mut before_input: F) -> Result<()>
+    where
+        F: FnMut() -> Result<()>,
+    {
         // 每个动作前都重新确认窗口几何：尺寸变了所有坐标都作废，
         // 硬撑着继续跑只会点错地方。
         let geometry = self.window.geometry().context("读取窗口几何失败")?;
@@ -192,9 +195,9 @@ impl Session {
         }
 
         match action.kind {
-            ActionType::Deploy => self.do_deploy(action),
-            ActionType::UseSkill => self.do_skill(action),
-            ActionType::Retreat => self.do_retreat(action),
+            ActionType::Deploy => self.do_deploy(action, &mut before_input),
+            ActionType::UseSkill => self.do_skill(action, &mut before_input),
+            ActionType::Retreat => self.do_retreat(action, &mut before_input),
             ActionType::Output => Ok(()),
             other => Err(anyhow!("帧复刻模式不支持动作 {other}")),
         }
@@ -236,7 +239,10 @@ impl Session {
     ///
     /// 游戏此刻已经被停在目标帧上，所以**不做** MAA 的 swipe-with-pause ——
     /// 那会在拖拽中途再发一次 ESC，把游戏从暂停切回运行。
-    fn do_deploy(&mut self, action: &Action) -> Result<()> {
+    fn do_deploy<F>(&mut self, action: &Action, before_input: &mut F) -> Result<()>
+    where
+        F: FnMut() -> Result<()>,
+    {
         let loc = action
             .location
             .ok_or_else(|| anyhow!("部署动作缺少格子坐标"))?;
@@ -284,6 +290,8 @@ impl Session {
             self.viewport.scale(),
         );
 
+        before_input().context("部署输入前的尺子复核失败")?;
+
         log::info!(
             "deploy {} -> tile {loc} (client {tile_client}), drag {}ms{}",
             action.name,
@@ -307,10 +315,14 @@ impl Session {
     }
 
     /// 技能动作完全交给 AFA：复刻器只把目标干员交给当前鼠标位置，再触发 AFA 热键。
-    fn do_skill(&mut self, action: &Action) -> Result<()> {
+    fn do_skill<F>(&mut self, action: &Action, before_input: &mut F) -> Result<()>
+    where
+        F: FnMut() -> Result<()>,
+    {
         let target = self.resolve_target(action)?;
         let screen = self.geometry.client_to_screen(target);
         mouse::set_cursor_pos(screen).context("把技能目标交给 AFA 失败")?;
+        before_input().context("技能输入前的尺子复核失败")?;
         self.afa
             .dispatch(AfaAction::PauseSkill)
             .context("AFA 暂停技能热键失败")?;
@@ -319,10 +331,14 @@ impl Session {
     }
 
     /// 撤退动作完全交给 AFA：复刻器只把目标干员交给当前鼠标位置，再触发 AFA 热键。
-    fn do_retreat(&mut self, action: &Action) -> Result<()> {
+    fn do_retreat<F>(&mut self, action: &Action, before_input: &mut F) -> Result<()>
+    where
+        F: FnMut() -> Result<()>,
+    {
         let target = self.resolve_target(action)?;
         let screen = self.geometry.client_to_screen(target);
         mouse::set_cursor_pos(screen).context("把撤退目标交给 AFA 失败")?;
+        before_input().context("撤退输入前的尺子复核失败")?;
         self.afa
             .dispatch(AfaAction::PauseRetreat)
             .context("AFA 暂停撤退热键失败")?;

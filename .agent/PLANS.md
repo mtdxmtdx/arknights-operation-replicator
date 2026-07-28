@@ -20,6 +20,8 @@
 - 当前代码已经完成主要委托链路和自动测试；外部程序始终由用户操作。用户实机日志已经证明
   链路可完成全流程，但也暴露开局尺子盲区和运行期 Pause 临界时序。
 - 保护用户已有改动；本任务不修改 AFA 配置、不自动启动外部程序、不回退旧 Rust 技能/撤退时序。
+- `examples/sample-job.json` 当前 10/40/60 只用于早帧 Resume/Pause/Pulse 回归；正式 M8 验收副本
+  的首动作必须至少第 60 帧，不能把诊断样例的开局盲区失败算作正式稳定性结果。
 
 ## 已冻结的设计决定（2026-07-27）
 
@@ -29,6 +31,7 @@
 - Rust 负责：部署拖拽、自适应逐帧脉冲、鼠标定位/停靠、发送一次 AFA 热键。
 - 开局检测到战斗后，复刻器不发送 `PressPause`，只等待尺子确认 AFA 已停在可信的 `1x_paused`；
   `AutoBeginPause` 必须为 `1`。AFA 未自动暂停时中止，不补发开局热键。
+- 尺子确认 AFA 开局暂停后，Runner 零输入等待 1 秒再进入编队绑定，等待期间不发送任何热键或脉冲。
 - AFA 不可用、退出、降权、配置指纹变化或游戏失焦时，复刻器失败关闭；禁止回退旧 Rust
   技能/撤退三触控、Hover、固定长按等时序，也禁止静默重试。
 - `Output` 和 `Finish` 都是零输入；旧 `after_last_action` 只兼容解析，不改变收尾行为。
@@ -101,6 +104,15 @@
   `cargo build --release`，并检查 `cargo fmt --all`、`git diff --check`。
 - [ ] M8：用户实机验收（进行中、未稳定通过）。当前构建连续 4 次完整确认后，第 5 次因开局
   尺子盲区从第 0 帧跳到第 33 帧并越过首目标 10；更早还有运行期 Pause 临界失败和一次错帧。
+  2026-07-28 又复现尺子已到 11 而 Machine/UI 仍为 10 后继续派发 Deploy；本地已加入动作前
+  尺子稳定屏障、实际输入前最终复核和尺子权威 UI，待用户用 11:39:16 release 构建复验。
+  该构建随后证明动作已被拦截，但最后 Pulse 曾以单条旧 paused 提前结算，之后出现真实 running
+  并推进到 11；本地现要求 running→paused 或连续两条 paused 才结算，待用 12:01:01 release 复验。
+  12:01:01 构建已完成第 10 帧部署，但运行期 Pause 被四条同帧/近邻分析样本过早判死；本地现改为
+  按真实 elapsed 增长计算 6 帧宽限并保留 2 帧安全余量，待用 12:43:35 release 复验。
+  12:43:35 构建随后暴露 Resume 连续重发：派发前积压的 paused 样本拥有新 frame_id，错误地把
+  `paused` 重置为 true。本地现用 `resume_in_flight` 等待首条可信 running 回执，待用 13:05:30
+  release 复验每个运行区间只派发一次 Resume。
   外部程序只由用户操作。
 - [ ] M9：M8 通过后才做录像 CSV 的 10/10 目标帧核验；未通过不得宣称端到端完成。
 
@@ -121,10 +133,11 @@
 ## 已验证证据
 
 - `cargo test -p repl-input`：34 个测试通过，包含 AFA UTF-16 LE/BE INI 回归覆盖。
-- `cargo test -p repl-app`：20 个测试通过。
+- `cargo test -p repl-app`：23 个测试通过；新增目标 10、尺子最新 11 时禁止派发、目标帧最新可信
+  样本允许派发，以及 Session 准备动作期间从 10 前进到 11 时由最终输入边界拒绝的回归覆盖。
 - `cargo check -p repl-app`：通过。
 - `cargo test --workspace`：通过（各 crate 全部测试和 doctest 通过；`repl-input` 当前 34 项，
-  `repl-core` 当前 100 项，`repl-app` 当前 20 项）。
+  `repl-core` 当前 103 项，`repl-app` 当前 23 项）。
 - `cargo clippy --workspace --all-targets -- -D warnings`：通过。
 - `cargo build --release`：通过。
 - `cargo fmt --all`、`git diff --check`：通过。
@@ -148,4 +161,16 @@
 - `Settings.ini` 的四个键名已由同工作区 AFA 源码确认，但实际值、热键捕获和动作效果仍必须由首次
   实机日志校验；发现协议格式不一致时先停用委托，不做兼容性猜测。
 - 游戏失焦、AFA 重启、配置改动和非 1x 状态都视为不可恢复的本次运行失败。
+- 2026-07-28 日志与现场显示证明动作前 2 秒盲等期间尺子可能从目标 10 更新到 11，而 Runner 仍按
+  Machine 游标 10 派发。根因是动作注入阶段没有消费/校验最新尺子样本，且 UI 运行时禁止尺子覆盖
+  Machine 游标。本地修复改为完整稳定期持续检查尺子并让 UI 始终显示尺子帧；尚待实机复验。
+- 2026-07-28 11:39:16 构建日志在目标 10 记录 `1x_running` 且没有 Deploy。结合 Machine 只有在
+  已接受 paused 后才能进入动作前屏障，可确定单条旧 paused 提前结束了 Pulse 事务。修复后单条
+  paused 只作候选，正常路径以 running→paused 结算，漏采/空脉冲以连续两条 paused 结算。
+- 2026-07-28 12:01:01 构建在 Deploy=10 确认成功后以 `PauseIneffective` 中止。AFA PressPause 本身
+  持有 ESC 50ms，而旧探针四条尺子样本约 67ms，且重复同一 elapsed 也会计数。修复后只按真实
+  elapsed 增长判定，6 帧约 200ms，并由 FRAME_LEAD 编译期断言保留 2 帧安全余量。
+- 2026-07-28 12:43:35 构建在动作确认后的巡航中，每个 cursor 成对记录 Resume，最终累计约 28 次
+  `ReleasePause` 并使一次 Pulse 从 33 跨到 63。新 frame_id 不等于新输入后的画面：Resume 现在
+  必须等可信 running 回执，期间 paused/unknown 只推进 `last_frame_id`，不能更新逻辑状态或触发重发。
 - 每个里程碑完成后更新 `docs/CURRENT_STATE.md`；长期边界变化才新增 ADR，不把聊天记录当状态。

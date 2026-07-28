@@ -1,10 +1,10 @@
 # 当前状态
 
-更新时间：2026-07-27
+更新时间：2026-07-28 13:43:14 +08:00
 
 ## 当前目标
 
-将开局暂停、普通暂停/恢复、暂停技能和暂停撤退交给用户已启动的 AFA，同时保留部署和自适应逐帧脉冲的 Rust 直注入；动作必须以派发后的新尺子样本确认目标帧和暂停状态。
+将开局暂停、普通暂停/恢复、暂停技能和暂停撤退交给用户已启动的 AFA，同时保留部署和自适应逐帧脉冲的 Rust 直注入；动作派发前后都必须以尺子为绝对帧唯一真源，不能使用滞后的 Machine 游标盲发或确认动作。
 
 ## 已验证成果
 
@@ -18,8 +18,24 @@
 - UI 已显示 AFA 就绪状态，开始前执行只读预检，编队确认后尝试一次恢复游戏前台。
 - Runner 检测到战斗后不再发送开局 `PressPause`，只等待 AFA 自动开局暂停产生可信的
   `1x_paused`；状态机用独立的 `OpeningPauseDelegated`/`OpeningPauseIneffective` 语义确认零输入边界。
-- 局部自动验证：`cargo test -p repl-input` 34/34、`cargo test -p repl-app` 20/20、`cargo check -p repl-app` 通过。
-- `repl-core` 100/100 通过，包含开局零输入委托、AFA 未自动暂停中止和运行期 Pause 独立确认测试。
+- 尺子确认 AFA 已完成开局暂停后，Runner 会零输入等待 1 秒，再进入编队绑定和后续操作。
+- Runner 将动作前原有的 2 秒盲等改为尺子稳定屏障：持续消费新样本，最终只有最新状态仍为目标帧的
+  可信 `1x_paused` 才允许派发；尺子已从目标 10 到 11 时会在部署/AFA 输入前中止。返回样本的
+  `frame_id` 继续作为派发后确认水位。UI 运行期间也直接显示尺子 `total_elapsed_frames`，不再被
+  Machine 的滞后游标覆盖。Session 完成部署识别/坐标准备后，还会在首个拖拽或 AFA 热键前做一次
+  最终尺子复核，封住屏障结束到实际输入之间的准备时间竞态。
+- Pulse 收尾不再接受单条 `paused`：观察到 `running` 时必须等后续 `paused`；未观察到中间运行态
+  （空脉冲或尺子漏采）时必须连续收到两条新 `paused`。这避免脉冲前已进入尺子管线的旧暂停画面
+  被误当作最终暂停，并记录 `pulse deferred/observed running/settled` 调试证据。
+- 运行期 AFA Pause 确认不再按尺子样本条数判死，而是从派发帧计算真实 `elapsed` 增长；同一逻辑帧
+  的重复 running 样本不消耗宽限。最多允许前进 6 帧（约 200ms），`FRAME_LEAD=8` 编译期保证仍
+  留 2 帧安全余量。日志记录 AFA Resume/Pause 派发边界、pending advance 和最终确认。
+- 运行期 AFA Resume 现由 `resume_in_flight` 建模：`ResumeSent` 后，在第一条可信 running 样本到来
+  前拒绝新的 paused/unknown 积压样本，不更新 Machine 游标；命令生成器同时强制只返回
+  `AwaitFrame`，从而禁止同一运行区间重复发送 `ReleasePause`。确认日志为 `runtime resume confirmed`。
+- 局部自动验证：`cargo test -p repl-input` 34/34、`cargo test -p repl-app` 23/23、`cargo check -p repl-app` 通过。
+- `repl-core` 103/103 通过，包含开局零输入委托、AFA 未自动暂停中止、运行期 Pause 重复样本、
+  Resume 积压 paused 样本隔离和 `paused(旧) → running → paused(最终)` Pulse 收尾回归测试。
 - 2026-07-27 已冻结并写入计划的设计约束：确认窗口拒绝一切运行态；`0.2x_paused` 只能过渡，
   最终必须是目标帧 `1x_paused`；同帧动作各自使用派发前 `min_frame_id`；确认循环位于 Runner；
   XButton/滚轮走鼠标事件；AFA INI 键名集中定义但必须通过首次实机日志验证。
@@ -43,13 +59,30 @@
   `1x_paused` 并零输入结束；第 5 次在任何动作派发前，从开局第 0 帧恢复后第一条可信读数
   已到第 33 帧，越过首目标 10。此前同一构建还出现过两次运行期 Pause 临界失败和一次 Deploy
   确认落在第 11 帧；链路可工作，但成功率未达到验收要求。
+- 2026-07-28 的 10/30/60 诊断作业再次复现：部署期间尺子已显示 11，复刻器仍显示 Machine 游标 10，
+  派发后才以 `elapsed=11` 确认失败。上述本地修复已由回归测试覆盖并完成 release 重建，但尚未经过
+  用户实机复验；不能据此宣称 M8 已通过。
+- 11:39:16 构建实机复验没有发出 Deploy，但在目标 10 的动作前屏障收到更新的
+  `1x_running elapsed=10`，随后画面推进到 11。状态机能进入动作前屏障证明它此前已用一条旧
+  `1x_paused elapsed=10` 提前结算最后一发 Pulse；本地已改为事务式/双暂停确认，尚待再次实机复验。
+- 12:01:01 构建已在第 10 帧完成部署并确认，但部署后的运行期 Pause 在四条分析样本内以
+  `PauseIneffective` 中止，游戏随后越过目标 30。根因是旧逻辑统计 `frame_id` 样本数而非实际
+  `elapsed` 增长；本地已改为 6 逻辑帧宽限，尚待实机复验。
+- 12:43:35 构建的最新实机日志显示每个 cursor 连续派发两次 Resume，累计发送约 28 次
+  `ReleasePause`，随后一次 Pulse 从 33 跑到 63。根因是动作前等待期间积压的新 frame_id paused
+  样本在 `ResumeSent` 后把 `self.paused` 重新置真；13:05:30 release 已加入 Resume running 回执
+  屏障并完成自动验证，尚待用户实机复验。
 - 第 5 次失败前尺子先报告 `not_in_battle`/不可信，说明 AFA 第 0 帧自动暂停会冻结开局标题和
-  费用条渐显，恢复后存在尺子盲区。当前示例首动作已移到第 60 帧作为验收规避，但代码尚未
-  识别或根治该盲区；运行期 Pause 的 4 样本临界窗口也尚未修复。
+  费用条渐显，恢复后存在尺子盲区。仓库示例当前保留 10/40/60 作为早帧时序回归；正式验收副本
+  必须把首动作移到至少第 60 帧。代码尚未识别或根治该盲区；运行期 Pause 的 4 样本临界窗口已
+  完成本地修复但尚未实机确认。
 - ACCEPTANCE §5.4 的录像 CSV 10/10 核验尚未开始；M8 稳定前不得开始。
 
 ## 下一步
 
-阶段性知识收尾后，下一步在当前分支分别处理：①开局 `not_in_battle` 尺子盲区和首目标安全策略；
-②运行期 Pause 不应只按 4 条样本判死。修复时增加逐条帧/状态诊断，重新构建后用首动作第 60 帧
-的示例重跑 M8；稳定通过后才开始 M9 的录像 10/10 核验。不得修改 AFA 配置或回退旧 Rust 时序。
+先用 2026-07-28 13:05:30 本地重建的 `target\release\repl-app.exe` 复验部署后的巡航。每个运行区间
+只能出现一次 `dispatching AFA runtime resume`；随后可有若干
+`runtime resume waiting for running state`，但必须由一条 `runtime resume confirmed` 结束，期间不能
+再次 Resume。接近下一目标后只允许一次 Pause，并在 `runtime pause confirmed` 后才进入 Pulse。
+若 Resume 仍成对出现或单次 Pulse 跨越大量帧，保存新日志并停止验收。稳定通过后才开始 M9 的
+录像 10/10 核验；不得修改 AFA 配置或回退旧 Rust 时序。

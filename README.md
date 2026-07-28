@@ -67,7 +67,9 @@ cargo build --release
 
 MAA copilot schema 的超集：现成 MAA 作业加上每个动作的 `frame`（绝对逻辑帧）
 和一个顶层 `frame_replicator` 块即可。示例见
-[examples/sample-job.json](examples/sample-job.json)。
+[examples/sample-job.json](examples/sample-job.json)。该文件当前使用 `10/40/60` 帧来回归早帧
+Resume/Pause/Pulse 时序；正式端到端验收应先复制并把首动作移到至少第 60 帧，以避开尚未根治的
+开局费用条盲区。
 
 ## 工程结构
 
