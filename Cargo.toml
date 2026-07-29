@@ -28,6 +28,7 @@ repl-vision = { path = "crates/repl-vision" }
 repl-capture = { path = "crates/repl-capture" }
 
 anyhow = "1"
+base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png"] }
 log = "0.4"
 env_logger = "0.11"
@@ -43,7 +44,9 @@ slint = { version = "1.8", default-features = false, features = [
     "backend-winit",
     "renderer-software",
     "std",
+    "raw-window-handle-06",
 ] }
+raw-window-handle = "0.6"
 slint-build = "1.8"
 thiserror = "2"
 tungstenite = "0.24"

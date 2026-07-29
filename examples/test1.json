@@ -1,0 +1,64 @@
+{
+  "actions": [
+    {
+      "direction": "Down",
+      "frame": 10,
+      "location": [
+        3,
+        2
+      ],
+      "name": "桃金娘",
+      "type": "Deploy"
+    },
+    {
+      "frame": 40,
+      "name": "桃金娘",
+      "type": "Skill"
+    },
+    {
+      "direction": "Left",
+      "frame": 150,
+      "location": [
+        2,
+        3
+      ],
+      "name": "风笛",
+      "type": "Deploy"
+    },
+    {
+      "frame": 240,
+      "name": "风笛",
+      "type": "Skill"
+    },
+    {
+      "frame": 240,
+      "name": "桃金娘",
+      "type": "Retreat"
+    },
+    {
+      "frame": 249,
+      "name": "风笛",
+      "type": "Retreat"
+    }
+  ],
+  "doc": {
+    "details": "",
+    "title": "1-7"
+  },
+  "frame_replicator": {
+    "after_last_action": "pause",
+    "speed": "1x",
+    "version": 1
+  },
+  "opers": [
+    {
+      "name": "桃金娘",
+      "skill": 1
+    },
+    {
+      "name": "风笛",
+      "skill": 1
+    }
+  ],
+  "stage_name": "main_01-07"
+}
