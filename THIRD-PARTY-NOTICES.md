@@ -61,7 +61,8 @@ AGPL-3.0 与 GPL-3.0 的合并依据是 GPLv3 第 13 条：GPLv3 明确允许把
 当前版本的 `repl-app/src/session.rs` **不再移植**上游的
 `ActionPauseSelect` / `ActionPauseSkill` / `ActionPauseRetreat` 的选中与功能键
 时序。它只负责部署触控、把 Skill / Retreat 的目标定位到当前鼠标位置，并向
-用户已启动的外部 AFA 发送一次配置中的热键；AFA 的技能/撤退时序仍由 AFA 自己执行。
+用户已启动的外部 AFA 发送一次配置中的热键；AFA 的暂停、恢复、逐帧、技能和撤退时序仍由 AFA
+自己执行。
 `repl-input/src/afa.rs` 是本项目的只读 INI 适配与 `SendInput` 委托代码，不是对 AFA
 源代码的复制。复刻器不修改 AFA 配置，也不在 AFA 不可用时回退这段已移除的 Rust 时序。
 

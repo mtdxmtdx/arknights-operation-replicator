@@ -11,31 +11,31 @@
 
 ## 状态
 
-核心 AFA 委托与运行链路已于 2026-07-29 完成 M8 实机验收；M9 的录像与 CSV 10/10 精确帧核验
-仍未执行。首次安装按[完整验收手册](ACCEPTANCE.md)执行；当前构建的验收状态以
-[当前版本实机验收](docs/REAL_MACHINE_ACCEPTANCE.md) 为唯一入口。技能和撤退由 AFA 执行，
+核心 AFA 委托与运行链路已于 2026-07-29 完成 M8 实机验收；2026-07-30，用户确认当前 AFA 逐帧
+构建完成 M9 录像与 CSV 10/10 精确帧核验。首次安装按[完整验收手册](ACCEPTANCE.md)执行；状态以
+[当前版本实机验收](docs/REAL_MACHINE_ACCEPTANCE.md) 为唯一入口。暂停、恢复、逐帧、技能和撤退由 AFA 执行，
 复刻器只在派发后的新尺子样本确认目标帧与暂停状态后才把动作标记为完成。
 
 | 验收节 | 状态 |
 | --- | --- |
 | 1 帧源接入 | ✅ 实机通过（2026-07-26） |
-| 2 单帧脉冲精度 | ✅ 实机通过（100 次脉冲 0 跨帧、35% 命中，纯自旋定时修复后） |
+| 2 单帧推进精度 | ✅ 当前 AFA `33ms` 路径已纳入 M9 10/10；旧 Rust 脉冲只保留历史诊断 |
 | 3 地图坐标投影 | ✅ 实机通过（1-7，绿十字对齐格子中心，人工核对） |
 | 4 部署栏识别 | ✅ 实机通过（2560×1440，`uiScaler=0`，职业判定已人工核对） |
-| 5 端到端复刻 | ✅ M8 实机通过（2026-07-29）；M9 录像与 CSV 10/10 待执行 |
-| 6 资源占用 | ✅ 当前二进制 14.0 MiB；历史空闲私有工作集 5.4MB |
+| 5 端到端复刻 | ✅ M8 实机通过（2026-07-29）；M9 录像与 CSV 10/10 通过（2026-07-30） |
+| 6 资源占用 | ✅ 当前二进制约 14.3 MiB；历史空闲私有工作集 5.4MB |
 
 输入适配、AFA 解析和动作确认测试已通过；`cargo test --workspace`、clippy、release 构建、
 格式检查和 diff 检查均已通过。M8 实机已确认启动门禁、焦点交接、绑定路径、AFA
-Resume/Pause 委托、Deploy → Skill → Retreat、零跨帧和最终目标帧暂停。M9 尚未执行；带风险的
-“继续”运行不能计入 M9。
+Resume/Pause 委托、Deploy → Skill → Retreat、零跨帧和最终目标帧暂停；当前 AFA 逐帧构建已由
+用户确认 M9 10/10。带风险的“继续”运行仍不能计入 M9。
 
 ## 运行前提
 
 1. **Windows 10/11**，《明日方舟》**PC 客户端**（`Arknights.exe`）。
 2. **AFA（Arknights Frame Assistant）** 已由用户以管理员权限启动；复刻器只读
    `%APPDATA%\ArknightsFrameAssistant\PC\Settings.ini`，要求 `PressPause`、
-   `ReleasePause`、`PauseSkill`、`PauseRetreat` 四项热键有效，且开启 AFA 自动开局暂停、
+   `ReleasePause`、`PauseSkill`、`PauseRetreat`、`33ms` 五项热键有效，且开启 AFA 自动开局暂停、
    关闭卫戍协议默认模式。AFA 不可用时复刻器不会回退旧 Rust 时序。
 3. **[ArknightsCostBarRuler](https://github.com/ZeroAd-06/ArknightsCostBarRuler)** 独立运行，
    并已完成一次费用条校准。它是帧数的唯一真源，复刻器通过其 `127.0.0.1:2606`
@@ -58,8 +58,9 @@ cargo build --release
 | --- | --- |
 | `repl-app.exe` | 主程序（图形界面） |
 | `frames-probe.exe` | 实时打印尺子的帧数与状态，用于验收帧源 |
-| `step-test.exe` | 单帧脉冲精度实测，**最关键的验收工具** |
+| `step-test.exe` | 旧 Rust 直接脉冲诊断工具（不属于主复刻路径） |
 | `step-sweep.exe` | 脉冲传递函数扫描，`step-test` 不过时用它定位原因 |
+| `afa-step-test.exe` | AFA `33ms` 逐帧动作统计工具；与主复刻使用同一热键 |
 | `tile-preview.exe` | 把算出的格子坐标画到真实截图上，验证地图投影 |
 | `deploy-scan.exe` | 部署栏识别自检 |
 
@@ -86,9 +87,8 @@ cargo build --release
 
 MAA copilot schema 的超集：现成 MAA 作业加上每个动作的 `frame`（绝对逻辑帧）
 和一个顶层 `frame_replicator` 块即可。示例见
-[examples/sample-job.json](examples/sample-job.json)。该文件当前使用 `10/40/60` 帧来回归早帧
-Resume/Pause/Pulse 时序；正式端到端验收应先复制并把首动作移到至少第 60 帧，以避开尚未根治的
-开局费用条盲区。
+[examples/sample-job.json](examples/sample-job.json)。该文件使用 `10/40/60` 帧覆盖
+Resume/Pause/Pulse 时序，也可用于端到端精确验收；首动作没有第 60 帧下限。
 
 ## 工程结构
 

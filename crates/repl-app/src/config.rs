@@ -5,7 +5,7 @@
 //!
 //! 两个文件都放在可执行文件所在目录（便携式，跟尺子的做法一致）：
 //!
-//! - `config.json` —— MAA 资源目录、脉冲初值、免责声明是否已确认
+//! - `config.json` —— MAA 资源目录、旧脉冲兼容字段、免责声明是否已确认
 //! - `bindings.json` —— 编队绑定档案，按干员头像的感知哈希索引
 
 use std::{
@@ -24,7 +24,7 @@ pub const BINDINGS_FILE: &str = "bindings.json";
 pub struct Config {
     /// MAA 的 `resource` 目录。为空时启动向导会尝试自动定位。
     pub maa_resource_dir: String,
-    /// 逐帧脉冲的初始间隔（毫秒）。
+    /// 旧版 Rust 直接脉冲的初始间隔；保留用于兼容现有 config.json，主复刻不再使用。
     pub initial_gap_ms: u32,
     /// 用户是否已确认免责声明。
     pub disclaimer_accepted: bool,

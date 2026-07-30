@@ -7,14 +7,16 @@
 
 | 项目 | 当前值 |
 | --- | --- |
-| 源码分支 | `develop`，验收时基线为 `d85eb53`，其上为本次本地改动 |
+| 源码分支 | `develop`，本轮验收与收尾代码已同步到 `origin/develop` |
 | 可执行文件 | `D:\Arknights Operation Replicator\replicator\target\release\repl-app.exe` |
-| 文件大小 | `14,710,272` 字节 |
-| SHA-256 | `4D510B3146FA40C95437E3E2914E7E8E42A2C91C53CFA8A8E035EEFF267AF8BD` |
+| M8 验收基线文件大小 | `14,710,272` 字节 |
+| M8 验收基线 SHA-256 | `4D510B3146FA40C95437E3E2914E7E8E42A2C91C53CFA8A8E035EEFF267AF8BD` |
+| 当前 AFA 逐帧开发构建 | `14,963,200` 字节；SHA-256 `09EEED203464B64D55F5FA53803006B7BB827EAF35648888E42D58A0D064AB6D` |
 | 自动门禁 | workspace test、Clippy、Release build、格式检查、`git diff --check` 已通过 |
-| 运行态 | M8 已于 2026-07-29 由用户实机确认通过；M9 尚未执行 |
+| 运行态 | M8 基线已于 2026-07-29 通过；2026-07-30 用户确认当前 AFA 逐帧构建按本页完成 M9 录像与 CSV 10/10 |
 
-验收前运行下面的只读命令，哈希不一致就停止，本页结论不适用于另一个二进制：
+验收前运行下面的只读命令。M8 通过结论绑定上表的 M8 基线哈希；M9 通过结论绑定当前 AFA 逐帧
+构建哈希：
 
 ```powershell
 $exe = 'D:\Arknights Operation Replicator\replicator\target\release\repl-app.exe'
@@ -36,14 +38,14 @@ PressPause=g
 ReleasePause=Space
 PauseSkill=XButton2
 PauseRetreat=XButton1
+33ms=r
 
 [Main]
 AutoBeginPause=1
 DefaultStrongHoldProtocol=0
 ```
 
-- 使用正式验收作业，首动作至少在第 60 帧。`examples/sample-job.json` 的 `10/40/60` 只用于早帧
-  回归，不作为稳定性通过证据。
+- `examples/sample-job.json` 的 `10/40/60` 可直接用于精确链路验收；首动作没有第 60 帧下限。
 - 作业至少覆盖 Deploy、Skill、Retreat；最后一次动作后应停在该动作的目标帧 `1x_paused`。
 
 任一配置不同、AFA 状态灯非绿色、尺子读数不可信或游戏不在目标关卡时，停止本轮；复刻器不会
@@ -89,8 +91,8 @@ DefaultStrongHoldProtocol=0
 
 ### 3.4 running 首样本且无档案（负向用例）
 
-只在首动作至少第 60 帧、可安全退出重开的关卡执行。使用未命中档案的编队，并让焦点后的第一条
-可信样本成为 `1x_running`。
+只在可安全退出重开的关卡执行。使用未命中档案的编队，并让焦点后的第一条可信样本成为
+`1x_running`。
 
 通过判据：本轮立即中止并提示“running 但没有完整绑定档案”；不显示人工绑定面板、不发送 AFA
 暂停键，也不继续派发 Deploy/Skill/Retreat。
@@ -125,7 +127,8 @@ M8 只有在下表全部通过时才完成：
 2026-07-29，用户明确确认本页 §3–§4 的 M8 功能与运行链路验收完成，验收对象为本页记录的
 `repl-app.exe`（SHA-256
 `4D510B3146FA40C95437E3E2914E7E8E42A2C91C53CFA8A8E035EEFF267AF8BD`）。该记录确认 M8 已通过，
-不自动代表 §5 风险继续、编辑器 GUI 或 §6 M9 已通过；详细截图和运行日志未纳入 Git 仓库。
+该 M8 记录本身不自动代表 §5 风险继续、编辑器 GUI 或 §6 M9；M9 的独立通过记录见 §6。详细
+截图和运行日志未纳入 Git 仓库。
 
 ## 5. 风险确认式继续（不计入 M9）
 
@@ -175,21 +178,40 @@ cargo run --release -p ruler-recorder -- -c config.json -o recordings -d 60
 ```
 
 连续完成 10 轮；任一动作差 1 帧、出现跨帧、重复热键或缺少录像/CSV，该轮即失败，M9 不通过。
+2026-07-30，用户明确确认当前哈希已按上述口径完成并通过 10/10；录像、CSV 与运行日志由用户
+保留，未纳入 Git 仓库。
 
 | 轮次 | 启动接管 | Deploy | Skill | Retreat | 最终暂停 | 结论 |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1 | ☐ | ☐ | ☐ | ☐ | ☐ |  |
-| 2 | ☐ | ☐ | ☐ | ☐ | ☐ |  |
-| 3 | ☐ | ☐ | ☐ | ☐ | ☐ |  |
-| 4 | ☐ | ☐ | ☐ | ☐ | ☐ |  |
-| 5 | ☐ | ☐ | ☐ | ☐ | ☐ |  |
-| 6 | ☐ | ☐ | ☐ | ☐ | ☐ |  |
-| 7 | ☐ | ☐ | ☐ | ☐ | ☐ |  |
-| 8 | ☐ | ☐ | ☐ | ☐ | ☐ |  |
-| 9 | ☐ | ☐ | ☐ | ☐ | ☐ |  |
-| 10 | ☐ | ☐ | ☐ | ☐ | ☐ |  |
+| 1 | ✅ | ✅ | ✅ | ✅ | ✅ | 通过 |
+| 2 | ✅ | ✅ | ✅ | ✅ | ✅ | 通过 |
+| 3 | ✅ | ✅ | ✅ | ✅ | ✅ | 通过 |
+| 4 | ✅ | ✅ | ✅ | ✅ | ✅ | 通过 |
+| 5 | ✅ | ✅ | ✅ | ✅ | ✅ | 通过 |
+| 6 | ✅ | ✅ | ✅ | ✅ | ✅ | 通过 |
+| 7 | ✅ | ✅ | ✅ | ✅ | ✅ | 通过 |
+| 8 | ✅ | ✅ | ✅ | ✅ | ✅ | 通过 |
+| 9 | ✅ | ✅ | ✅ | ✅ | ✅ | 通过 |
+| 10 | ✅ | ✅ | ✅ | ✅ | ✅ | 通过 |
 
 “带风险完成”的继续运行全部排除在下表之外；M9 只能使用第 0 帧“开始复刻”的普通精确运行。
+
+### 6.1 AFA 过帧诊断（与主链路同一动作）
+
+`afa-step-test` 通过 AFA 当前 `[Hotkeys]/33ms` 热键执行 1 倍速过帧，尺子独立等待稳定
+`running → paused` 并统计真实推进量。工具默认和最多执行 500 次；它不修改 AFA 配置。主复刻已
+委托同一个 `33ms` 动作，诊断结果可直接反映现役逐帧路径。
+
+准备条件与普通单帧验收相同，另外要求鼠标留在游戏客户区内但不能遮挡费用条。以管理员 PowerShell
+运行：
+
+```powershell
+Set-Location -LiteralPath 'D:\Arknights Operation Replicator\replicator'
+.\target\release\afa-step-test.exe 500
+```
+
+通过判据：完成 `500/500`、跨帧为 0、负数推进为 0、`+1` 命中不少于 125 次。连续 10 次空脉冲
+会提前停止，并提示检查鼠标是否位于客户区。
 
 ## 7. 失败即停与回传材料
 
@@ -206,7 +228,7 @@ cargo run --release -p ruler-recorder -- -c config.json -o recordings -d 60
 
 1. 与本页一致的二进制 SHA-256；
 2. 完整 `replicator.log`；
-3. AFA 六项实际配置值；
+3. AFA 七项实际配置值；
 4. 最终尺子与游戏画面截图；
 5. M9 轮次对应的录像和 CSV。
 

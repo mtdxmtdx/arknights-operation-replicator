@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Arknights Operation Replicator contributors
 
-import { Button, ScrollView, LineEdit } from "std-widgets.slint";
+import { Button, ComboBox, ScrollView, LineEdit } from "std-widgets.slint";
 import { Theme, Dot, Field } from "theme.slint";
 
 /// 时间轴上的一行动作。
@@ -70,6 +70,43 @@ component StatusLight inherits HorizontalLayout {
         color: Theme.text;
         font-size: 12px;
         vertical-alignment: center;
+    }
+}
+
+// 文档字段先在控件内形成草稿，仅在回车或失焦时提交一次。
+// 这样输入 249 只产生一条撤销记录，而不是 2、24、249 三条记录。
+component CommitLineEdit inherits LineEdit {
+    in property <string> value;
+    callback commit(string);
+    private property <bool> dirty: false;
+
+    text: root.value;
+
+    edited(value) => {
+        root.dirty = true;
+    }
+
+    accepted(value) => {
+        root.finish-editing();
+    }
+
+    changed has-focus => {
+        if !root.has-focus {
+            root.finish-editing();
+        }
+    }
+
+    changed value => {
+        if !root.has-focus && !root.dirty {
+            root.text = root.value;
+        }
+    }
+
+    function finish-editing() {
+        if root.dirty {
+            root.dirty = false;
+            root.commit(root.text);
+        }
     }
 }
 
@@ -255,18 +292,22 @@ export component MainWindow inherits Window {
     in property <[EditorActionRow]> editor-actions;
     in property <[DiagnosticRow]> editor-diagnostics;
     in property <[string]> editor-operators;
+    in property <[string]> editor-operator-options;
+    in-out property <int> editor-selected-operator-index: 0;
+    in property <[string]> editor-direction-options: ["上", "下", "左", "右"];
+    in-out property <int> editor-selected-direction-index: 3;
     in property <[MapCell]> editor-map-cells;
     in property <int> editor-map-width;
     in property <int> editor-map-height;
     in property <string> editor-map-status: "输入关卡标识以载入逻辑地图";
     in property <int> editor-selected-id: -1;
     in property <string> editor-selected-kind: "";
-    in property <string> editor-selected-frame: "";
-    in property <string> editor-selected-name: "";
-    in property <string> editor-selected-x: "";
-    in property <string> editor-selected-y: "";
-    in property <string> editor-selected-direction: "Right";
-    in property <string> editor-selected-doc: "";
+    in-out property <string> editor-selected-frame: "";
+    in-out property <string> editor-selected-name: "";
+    in-out property <string> editor-selected-x: "";
+    in-out property <string> editor-selected-y: "";
+    in-out property <string> editor-selected-direction: "Right";
+    in-out property <string> editor-selected-doc: "";
 
     // 编队绑定面板
     in property <bool> binding-visible;
@@ -387,13 +428,13 @@ export component MainWindow inherits Window {
                                 width: 210px;
                                 spacing: 3px;
                                 Text { text: "作业标题"; color: Theme.text-dim; font-size: 10px; }
-                                LineEdit { text: root.editor-title; edited => { root.editor-set-metadata("title", self.text); } }
+                                CommitLineEdit { value: root.editor-title; commit(value) => { root.editor-set-metadata("title", value); } }
                             }
                             VerticalLayout {
                                 width: 180px;
                                 spacing: 3px;
                                 Text { text: "关卡标识"; color: Theme.text-dim; font-size: 10px; }
-                                LineEdit { text: root.editor-stage; placeholder-text: "例如 main_01-07"; edited => { root.editor-set-metadata("stage", self.text); } }
+                                CommitLineEdit { value: root.editor-stage; placeholder-text: "例如 main_01-07"; commit(value) => { root.editor-set-metadata("stage", value); } }
                             }
                             VerticalLayout {
                                 spacing: 3px;
@@ -520,29 +561,39 @@ export component MainWindow inherits Window {
                             spacing: 7px;
                             Text { text: "类型  " + root.editor-selected-kind; color: Theme.accent; font-size: 12px; font-weight: 700; }
                             Text { text: "绝对帧"; color: Theme.text-dim; font-size: 10px; }
-                            LineEdit { text: root.editor-selected-frame; input-type: number; edited => { root.editor-set-action("frame", self.text); } }
+                            CommitLineEdit { value: root.editor-selected-frame; input-type: number; commit(value) => { root.editor-set-action("frame", value); } }
                             Text { text: "目标干员 / 轨道"; color: Theme.text-dim; font-size: 10px; }
-                            LineEdit { text: root.editor-selected-name; placeholder-text: "干员名"; edited => { root.editor-set-action("name", self.text); } }
+                            if root.editor-selected-kind != "注释": ComboBox {
+                                model: root.editor-operator-options;
+                                current-index <=> root.editor-selected-operator-index;
+                                selected(value) => {
+                                    root.editor-set-action("name", value == "— 选择干员 —" ? "" : value);
+                                }
+                            }
                             if root.editor-selected-kind == "部署": VerticalLayout {
                                 spacing: 6px;
                                 Text { text: "部署格（逻辑坐标）"; color: Theme.text-dim; font-size: 10px; }
                                 HorizontalLayout {
                                     spacing: 5px;
-                                    x-edit := LineEdit {
-                                        text: root.editor-selected-x;
+                                    x-edit := CommitLineEdit {
+                                        value: root.editor-selected-x;
                                         placeholder-text: "X";
                                         input-type: number;
-                                        edited => { root.editor-set-location(self.text, y-edit.text); }
+                                        commit(value) => { root.editor-set-location(value, y-edit.text); }
                                     }
-                                    y-edit := LineEdit {
-                                        text: root.editor-selected-y;
+                                    y-edit := CommitLineEdit {
+                                        value: root.editor-selected-y;
                                         placeholder-text: "Y";
                                         input-type: number;
-                                        edited => { root.editor-set-location(x-edit.text, self.text); }
+                                        commit(value) => { root.editor-set-location(x-edit.text, value); }
                                     }
                                 }
-                                Text { text: "朝向（Right / Down / Left / Up / None）"; color: Theme.text-dim; font-size: 10px; }
-                                LineEdit { text: root.editor-selected-direction; edited => { root.editor-set-action("direction", self.text); } }
+                                Text { text: "部署方向"; color: Theme.text-dim; font-size: 10px; }
+                                ComboBox {
+                                    model: root.editor-direction-options;
+                                    current-index <=> root.editor-selected-direction-index;
+                                    selected(value) => { root.editor-set-action("direction", value); }
+                                }
                                 Rectangle {
                                     height: max(76px, min(154px, root.editor-map-height * 14px + 4px));
                                     background: #101317;
@@ -574,7 +625,7 @@ export component MainWindow inherits Window {
                                 }
                             }
                             Text { text: "说明 / 输出内容"; color: Theme.text-dim; font-size: 10px; }
-                            LineEdit { text: root.editor-selected-doc; edited => { root.editor-set-action("doc", self.text); } }
+                            CommitLineEdit { value: root.editor-selected-doc; commit(value) => { root.editor-set-action("doc", value); } }
                             HorizontalLayout {
                                 spacing: 5px;
                                 Button { text: "同帧 ↑"; clicked => { root.editor-move-order(-1); } }
@@ -691,20 +742,79 @@ export component MainWindow inherits Window {
 
         // ——— 日志 ———
         Rectangle {
-            height: 84px;
+            height: 118px;
             background: Theme.panel;
-            ScrollView {
-                // Rectangle 不是布局容器，显式占满固定高度的日志面板，
-                // 否则 ScrollView 会按内容的首选尺寸计算，无法形成可滚动视口。
+
+            Rectangle {
+                height: 26px;
+                background: Theme.panel-alt;
+                Rectangle { width: 3px; height: 100%; background: Theme.accent; }
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    spacing: 8px;
+                    Text {
+                        text: "运行日志";
+                        color: Theme.text;
+                        font-size: 11px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { }
+                    Text {
+                        text: "将鼠标放在此处，滚轮浏览历史";
+                        color: Theme.text-dim;
+                        font-size: 10px;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            Rectangle {
+                y: 26px;
                 width: 100%;
-                height: 100%;
-                Text {
-                    // 给文本绑定视口宽度，换行后的首选高度才能超过视口高度。
-                    width: 100%;
-                    text: log-text;
-                    color: Theme.text-dim;
-                    font-size: 11px;
-                    wrap: word-wrap;
+                height: parent.height - self.y;
+                background: #181c21;
+
+                log-scroll := ScrollView {
+                    x: 6px;
+                    y: 4px;
+                    width: parent.width - 12px;
+                    height: parent.height - 8px;
+                    // 显式给出内容高度，避免单个 Text 被按视口高度压缩，导致滚轮无可滚动范围。
+                    viewport-width: self.visible-width;
+                    viewport-height: max(self.visible-height, log-body.preferred-height + 16px);
+
+                    log-body := Text {
+                        x: 8px;
+                        y: 8px;
+                        width: max(1px, log-scroll.visible-width - 32px);
+                        height: self.preferred-height;
+                        text: log-text;
+                        color: Theme.text-dim;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                        vertical-alignment: top;
+                    }
+                }
+
+                // ScrollView 的滚动条仍可拖动；内容区域额外接管滚轮，保证鼠标不必精确压在
+                // 14px 宽的滚动条上。viewport-y 使用负偏移：0 是顶部，负最大值是底部。
+                TouchArea {
+                    x: log-scroll.x;
+                    y: log-scroll.y;
+                    width: max(0px, log-scroll.width - 14px);
+                    height: log-scroll.height;
+                    scroll-event(event) => {
+                        if (event.delta-y != 0px && log-scroll.viewport-height > log-scroll.visible-height) {
+                            log-scroll.viewport-y = max(
+                                -(log-scroll.viewport-height - log-scroll.visible-height),
+                                min(0px, log-scroll.viewport-y + event.delta-y)
+                            );
+                            return accept;
+                        }
+                        reject
+                    }
                 }
             }
         }

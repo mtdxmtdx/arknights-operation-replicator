@@ -122,6 +122,9 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.set_editor_actions(ModelRc::new(VecModel::<EditorActionRow>::default()));
     ui.set_editor_diagnostics(ModelRc::new(VecModel::<DiagnosticRow>::default()));
     ui.set_editor_operators(ModelRc::new(VecModel::<SharedString>::default()));
+    ui.set_editor_operator_options(ModelRc::new(VecModel::from(vec![SharedString::from(
+        "— 选择干员 —",
+    )])));
     ui.set_editor_map_cells(ModelRc::new(VecModel::<MapCell>::default()));
 
     let ruler = Arc::new(RulerClient::connect(config.borrow().ruler_ws_url.clone()));
@@ -851,8 +854,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 &ui,
                 &log,
                 &format!(
-                    "MAA 资源目录：{dir}\n脉冲初值：{}ms\n配置文件在可执行文件旁边的 config.json",
-                    config.borrow().initial_gap_ms
+                    "MAA 资源目录：{dir}\n逐帧推进：AFA [Hotkeys]/33ms\n配置文件在可执行文件旁边的 config.json"
                 ),
             );
         });
@@ -1308,7 +1310,7 @@ fn pump_progress(
                             append_log(
                                 &ui,
                                 &log,
-                                "警告：出现过跨帧，本次复刻的帧精度不可信。可以把 config.json 里的 initial_gap_ms 调小 2–3ms 再试。",
+                                "警告：AFA 逐帧动作出现过跨帧，本次复刻的帧精度不可信。请保留录像、CSV 和日志后停止验收。",
                             );
                         }
                     }
@@ -1426,6 +1428,8 @@ fn refresh_editor(ui: &MainWindow, editor: &EditorState, runnable: &Rc<RefCell<O
         .iter()
         .map(|name| name.as_str().into())
         .collect();
+    let mut operator_options = vec![SharedString::from("— 选择干员 —")];
+    operator_options.extend(operators.iter().cloned());
 
     ui.set_editor_title(document.title().into());
     ui.set_editor_stage(document.stage_name().into());
@@ -1447,8 +1451,16 @@ fn refresh_editor(ui: &MainWindow, editor: &EditorState, runnable: &Rc<RefCell<O
     ui.set_editor_actions(ModelRc::new(VecModel::from(rows)));
     ui.set_editor_diagnostics(ModelRc::new(VecModel::from(diagnostic_rows)));
     ui.set_editor_operators(ModelRc::new(VecModel::from(operators)));
+    ui.set_editor_operator_options(ModelRc::new(VecModel::from(operator_options)));
 
     if let Some(action) = editor.selected_action() {
+        let operator_index = document
+            .operator_names()
+            .iter()
+            .position(|name| name == &action.name)
+            .map_or(0, |index| {
+                index.saturating_add(1).min(i32::MAX as usize) as i32
+            });
         ui.set_editor_selected_id(action.id.get().min(i32::MAX as u64) as i32);
         ui.set_editor_selected_kind(editor_kind_label(&action.kind).into());
         ui.set_editor_selected_frame(
@@ -1457,6 +1469,7 @@ fn refresh_editor(ui: &MainWindow, editor: &EditorState, runnable: &Rc<RefCell<O
                 .map_or_else(String::new, |frame| frame.to_string())
                 .into(),
         );
+        ui.set_editor_selected_operator_index(operator_index);
         ui.set_editor_selected_name(action.name.into());
         ui.set_editor_selected_x(
             action
@@ -1470,15 +1483,18 @@ fn refresh_editor(ui: &MainWindow, editor: &EditorState, runnable: &Rc<RefCell<O
                 .map_or_else(String::new, |point| point.y.to_string())
                 .into(),
         );
+        ui.set_editor_selected_direction_index(direction_index(action.direction));
         ui.set_editor_selected_direction(direction_name(action.direction).into());
         ui.set_editor_selected_doc(action.doc.into());
     } else {
         ui.set_editor_selected_id(-1);
         ui.set_editor_selected_kind("".into());
         ui.set_editor_selected_frame("".into());
+        ui.set_editor_selected_operator_index(0);
         ui.set_editor_selected_name("".into());
         ui.set_editor_selected_x("".into());
         ui.set_editor_selected_y("".into());
+        ui.set_editor_selected_direction_index(3);
         ui.set_editor_selected_direction("Right".into());
         ui.set_editor_selected_doc("".into());
     }
@@ -1608,6 +1624,15 @@ fn direction_name(direction: Direction) -> &'static str {
         Direction::Left => "Left",
         Direction::Up => "Up",
         Direction::None => "None",
+    }
+}
+
+fn direction_index(direction: Direction) -> i32 {
+    match direction {
+        Direction::Up => 0,
+        Direction::Down => 1,
+        Direction::Left => 2,
+        Direction::Right | Direction::None => 3,
     }
 }
 
@@ -1741,6 +1766,77 @@ fn pick_save_file() -> Option<String> {
 #[cfg(test)]
 mod editor_callback_tests {
     use super::*;
+
+    #[test]
+    fn editor_field_tracks_the_next_selected_action_after_user_input() {
+        let editor_ui = include_str!("../../../ui/main.slint");
+        for property in [
+            "editor-selected-frame",
+            "editor-selected-x",
+            "editor-selected-y",
+            "editor-selected-doc",
+        ] {
+            assert!(
+                editor_ui.contains(&format!("value: root.{property}")),
+                "{property} must remain bound to its committed editor value"
+            );
+        }
+        assert!(editor_ui.contains("changed value =>"));
+        assert!(editor_ui.contains("root.text = root.value;"));
+    }
+
+    #[test]
+    fn editor_text_fields_commit_as_one_edit_instead_of_each_keystroke() {
+        let editor_ui = include_str!("../../../ui/main.slint");
+
+        assert!(
+            editor_ui.contains("component CommitLineEdit"),
+            "editor fields need a draft/commit boundary"
+        );
+        assert!(
+            !editor_ui.contains("edited => { root.editor-set-action(\"frame\", self.text); }"),
+            "frame edits must not enter undo history on every keystroke"
+        );
+        assert!(
+            editor_ui.contains("commit(value) => { root.editor-set-action(\"frame\", value); }"),
+            "the confirmed frame value must still reach the editor callback"
+        );
+    }
+
+    #[test]
+    fn confirmed_frame_edit_is_one_undo_step() {
+        let mut editor = EditorState::default();
+        editor.add_action("Deploy");
+        let mut action = editor.selected_action().unwrap();
+        assert_eq!(action.frame, Some(0));
+
+        action.frame = Some(249);
+        editor.update_action(action).unwrap();
+        assert_eq!(editor.selected_action().unwrap().frame, Some(249));
+
+        assert!(editor.undo());
+        assert_eq!(editor.selected_action().unwrap().frame, Some(0));
+        assert!(editor.undo());
+        assert!(editor.document().actions().is_empty());
+    }
+
+    #[test]
+    fn editor_dropdowns_use_roster_and_four_supported_directions() {
+        let editor_ui = include_str!("../../../ui/main.slint");
+        assert!(editor_ui.contains("model: root.editor-operator-options;"));
+        assert!(editor_ui.contains("model: root.editor-direction-options;"));
+        assert!(editor_ui.contains("[\"上\", \"下\", \"左\", \"右\"]"));
+
+        for (label, direction, index) in [
+            ("上", Direction::Up, 0),
+            ("下", Direction::Down, 1),
+            ("左", Direction::Left, 2),
+            ("右", Direction::Right, 3),
+        ] {
+            assert_eq!(parse_editor_direction(label), direction);
+            assert_eq!(direction_index(direction), index);
+        }
+    }
 
     #[test]
     fn save_callback_releases_mutable_borrow_before_refreshing() {

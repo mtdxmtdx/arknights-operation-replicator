@@ -3,8 +3,7 @@
 //
 // 部署手势移植自 MaaAssistantArknights (AGPL-3.0-only) 的
 //   src/MaaCore/Task/BattleHelper.cpp (deploy_oper)
-// 逐帧脉冲和计时原语移植自 arknights-frame-assistant (GPL-3.0-only) 的
-//   src/lib/hotkey_actions.ahk；技能/撤退选中时序不在本项目复制，而由外部 AFA 委托执行。
+// 逐帧、暂停/恢复和技能/撤退时序不在本会话复制，而由外部 AFA 委托执行。
 // 详见仓库根目录 THIRD-PARTY-NOTICES.md。
 
 //! 一次复刻会话：把状态机的抽象指令翻译成真实的触控和按键。
@@ -18,9 +17,7 @@ use repl_core::{
     copilot::{Action, ActionType},
     gesture, Direction, Level, LevelPack, Point, TileProjection, Viewport,
 };
-use repl_input::{
-    mouse, precise_sleep, AfaAction, AfaController, GameKeys, PauseController, TouchInjector,
-};
+use repl_input::{mouse, precise_sleep, AfaAction, AfaController, GameKeys, TouchInjector};
 use repl_vision::{Card, Template, TemplateSet};
 
 use crate::config::{Binding, Config};
@@ -35,8 +32,6 @@ pub struct Session {
     pub projection: TileProjection,
     pub templates: TemplateSet,
     touch: TouchInjector,
-    /// 逐帧脉冲仍由 Rust 直接控制；普通暂停/恢复和技能/撤退走 AFA。
-    pub pause: PauseController,
     pub afa: AfaController,
     pub game_keys: GameKeys,
     /// 干员名 → 头像模板，用于在部署栏里认出这张卡。
@@ -107,7 +102,6 @@ impl Session {
             projection,
             templates,
             touch: TouchInjector::new(),
-            pause: PauseController::new(&game_keys),
             afa,
             game_keys,
             avatars: HashMap::new(),
@@ -227,10 +221,12 @@ impl Session {
             .context("AFA 普通恢复热键失败")
     }
 
-    /// 逐帧推进仍由 Rust 直接控制；这是运行期唯一的直接暂停脉冲入口。
-    pub fn pulse(&self, gap: Duration) -> Result<()> {
+    /// 通过 AFA 的 `33ms` 动作推进 1 倍速单帧。失焦时直接失败，不盲目重试。
+    pub fn pulse(&self) -> Result<()> {
         self.ensure_foreground()?;
-        self.pause.pulse(gap).context("逐帧脉冲失败")
+        self.afa
+            .dispatch(AfaAction::StepOneX)
+            .context("AFA 逐帧热键失败")
     }
 
     fn ensure_foreground(&self) -> Result<()> {

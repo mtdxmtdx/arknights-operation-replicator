@@ -128,14 +128,13 @@ pub enum Progress {
 /// 逐帧推进阶段每次脉冲前的等待时长。
 ///
 /// 目的是让游戏在下一次解暂停前有足够的稳定时间：选中 UI 动画完成、
-/// 尺子读数稳定、费用条不再抖动。1000ms = 约 30 帧的缓冲，足够彻底稳定。
-/// 代价：每次推进约 1060ms，FRAME_LEAD=8 时每个动作最多需要 ~9 秒对帧。
-const SLOW_STEP_PAUSE: Duration = Duration::from_millis(1000);
+/// 尺子读数稳定、费用条不再抖动。500ms = 约 15 帧的墙钟缓冲。
+const SLOW_STEP_PAUSE: Duration = Duration::from_millis(500);
 
 /// 到达目标帧后、注入动作前的等待时长。
 ///
 /// 给游戏时间确认"已暂停、已停在目标帧"的状态，再开始触控和键盘注入。
-const PRE_ACTION_PAUSE: Duration = Duration::from_secs(2);
+const PRE_ACTION_PAUSE: Duration = Duration::from_secs(1);
 
 /// AFA 委托或部署动作发出后，等待尺子确认动作仍停在目标帧的上限。
 const ACTION_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
@@ -163,7 +162,7 @@ impl<'a> Runner<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         copilot: Copilot,
-        config: &Config,
+        _config: &Config,
         run_mode: RunMode,
         session: &'a mut Session,
         frames: &'a dyn FrameSource,
@@ -172,10 +171,8 @@ impl<'a> Runner<'a> {
         binder: StartupBinder<'a>,
     ) -> Self {
         let machine = match &run_mode {
-            RunMode::FromZero => Machine::with_gap(copilot, config.initial_gap_ms),
-            RunMode::Continue(plan) => {
-                Machine::with_continuation(copilot, plan, config.initial_gap_ms)
-            }
+            RunMode::FromZero => Machine::new(copilot),
+            RunMode::Continue(plan) => Machine::with_continuation(copilot, plan),
         };
         Self {
             machine,
@@ -260,14 +257,14 @@ impl<'a> Runner<'a> {
                     self.machine.completed(Completion::ResumeSent);
                 }
 
-                Command::Pulse { gap } => {
+                Command::Pulse => {
                     // 逐帧推进阶段：每次脉冲前先等 SLOW_STEP_PAUSE。
                     // 这给游戏和尺子充足的稳定时间，避免在状态未稳定时解暂停
                     // （选中 UI 动画、费用条抖动等都会在这里安全地结束）。
                     if self.machine.phase() == Phase::Stepping {
                         precise_sleep(SLOW_STEP_PAUSE);
                     }
-                    self.session.pulse(gap)?;
+                    self.session.pulse()?;
                     self.machine.completed(Completion::PulseSent);
                 }
 

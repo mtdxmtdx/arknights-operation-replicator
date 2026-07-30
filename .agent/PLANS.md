@@ -1,6 +1,66 @@
 # 项目执行计划
 
-## 当前阶段：M8 验收与本地知识收尾（2026-07-29）
+## 已完成阶段：主复刻逐帧委托 AFA 与 M9（2026-07-30）
+
+### 目标与完成标准
+
+主复刻不再用 Rust 的恢复/暂停本地定时脉冲，统一调用 AFA `[Hotkeys]/33ms`（用户当前绑定 R）。
+尺子结算屏障和跨帧安全中止保持不变；逐帧前稳定等待从 1000ms 减到 500ms，目标帧动作前屏障从
+2000ms 减到 1000ms。AFA 缺少 `33ms` 时必须在预检阶段失败关闭。
+
+- [x] 将 `33ms` 从诊断可选热键升级为主程序必需热键，并覆盖缺失/重复/解析回归。
+- [x] Session 的主 Pulse 改为单次 `AfaAction::StepOneX`，移除主路径 `PauseController`。
+- [x] Machine 的 Pulse 命令移除本地 gap 参数；`initial_gap_ms` 仅保留旧配置兼容。
+- [x] 将逐帧前与动作前稳定等待分别缩短为 500ms 和 1000ms，确认超时保持 2 秒。
+- [x] 新增 ADR-0010，并同步规则、领域语言、README、验收和当前状态。
+- [x] 运行 workspace test、Clippy、Release build、格式与 diff 门禁；标准路径构建 SHA-256 为
+  `09EEED203464B64D55F5FA53803006B7BB827EAF35648888E42D58A0D064AB6D`。
+- [x] 2026-07-30 用户确认当前哈希按验收手册完成 M9 录像与 CSV 10/10；证据文件未纳入 Git。
+
+## 当前阶段：编辑器确认式输入与受控选择（2026-07-30）
+
+### 目标与完成标准
+
+编辑器内会写入作业历史的文本/数字输入只在回车或失焦时提交一次，不再按每个字符生成撤销记录；
+动作干员从已维护编队选择，部署方向从上、下、左、右选择，避免自由文本与作业枚举不一致。
+
+- [x] 用源码调用点回归稳定捕获绝对帧 `edited` 每键提交问题，确认旧实现为红。
+- [x] 增加 `CommitLineEdit` 草稿/提交边界；标题、关卡、帧数、X/Y 和说明在回车或失焦提交。
+- [x] 干员下拉仅使用“请选择干员”占位和当前编队；注释动作不显示干员选择。
+- [x] 部署方向下拉限定上、下、左、右，并回归验证中文值与内部枚举映射。
+- [x] 回归覆盖确认 249 后一次撤销回到旧帧、再撤销删除新动作；动作切换仍刷新字段。
+- [x] 运行 workspace test、Clippy、Release build、格式和 diff 门禁。
+- [ ] 用户实机确认回车/失焦提交、撤销粒度和两个下拉菜单。
+
+## 已完成阶段：动作属性切换隔离（2026-07-30）
+
+### 目标与完成标准
+
+修复动作属性输入框在用户编辑后脱离模型绑定、切换动作仍保留上一动作输入值的问题。选择任意
+动作时，属性面板必须始终显示该动作自己的帧数、干员、坐标、朝向和说明，不得把前一动作的值
+带入下一动作。
+
+- [x] 建立可稳定复现“先输入 123、再切换到值为 40 的动作仍显示 123”的 Slint 回归测试。
+- [x] 先用双向绑定隔离动作值；随后由当前阶段的 `CommitLineEdit` 显式同步与受控下拉取代，继续
+  覆盖帧数、干员、X/Y、朝向和说明。
+- [x] 定向回归由红转绿，`cargo check -p repl-app` 通过。
+- [x] 运行 workspace test、Clippy、Release build、格式和 diff 门禁。
+- [ ] 用户在实际编辑器中确认不同动作间属性不串值。
+
+## 当前阶段：复刻日志滚轮浏览（2026-07-30）
+
+### 目标与完成标准
+
+把复刻执行页的日志从固定文本框改成明确、可发现的运行控制台。长日志必须形成真实的垂直内容
+范围；鼠标位于日志正文上即可滚轮浏览，右侧滚动条仍可拖动，短日志不产生无意义滚动。
+
+- [x] 保持现有深色工业 HUD 风格，增加“运行日志”标题和滚轮提示。
+- [x] 显式绑定 ScrollView viewport 高度到换行文本首选高度，确保长文本形成滚动范围。
+- [x] 增加正文滚轮命中区并限制 `viewport-y`，同时给滚动条保留独立拖动区域。
+- [x] 运行 workspace test、Clippy、Release build、格式和 diff 门禁。
+- [ ] 用户实机确认滚轮方向、长日志浏览和窗口缩放体验。
+
+## 已完成阶段：M8 验收与本地知识收尾（2026-07-29）
 
 ### 目标与结果
 
@@ -10,7 +70,8 @@
 
 - [x] 用户确认 M8 §3–§4 全部通过；记录当前二进制身份和验收范围，不虚构未入库的日志/截图。
 - [x] README、AGENTS、ACCEPTANCE、REAL_MACHINE_ACCEPTANCE、EDITOR_ACCEPTANCE、
-  CURRENT_STATE 和本计划对齐；M9、继续实机、编辑器 GUI 仍明确为 pending。
+  CURRENT_STATE 和本计划对齐；在该阶段结束时，M9、继续实机、编辑器 GUI 仍为 pending；M9 后于
+  2026-07-30 由用户确认通过。
 - [x] 机械枚举 Markdown、规则链、分支/worktree、dirty 文件和忽略产物；Codex 生成记忆保持只读。
 - [x] 运行项目规定的测试、Clippy、Release build、格式与 diff 门禁。
 - [x] 将审计后的全部本地改动提交到本地 `develop`；没有 push、PR 或远端写入。
@@ -19,7 +80,8 @@
 
 M8 为 `real-machine verified`；代码与知识为本地已验证并闭环。M9、风险继续实机验收和编辑器 GUI
 验收不属于本次完成范围。根目录被忽略的验收截图和 `target/` 保留为清理候选，未获最终汇报后的
-明确确认前不删除。
+明确确认前不删除。该阶段先创建本地提交 `2e0292f`；用户随后明确要求上传，现已同步到
+`origin/develop`。
 
 ## 已完成阶段：风险确认式“继续”（2026-07-29）
 
@@ -139,8 +201,9 @@ M8 为 `real-machine verified`；代码与知识为本地已验证并闭环。M9
 
 ### 1. 输入所有权
 
-- AFA 负责：自动开局暂停、普通暂停、普通恢复、暂停技能、暂停撤退。
-- Rust 负责：部署拖拽、自适应逐帧脉冲、鼠标定位/停靠、发送一次 AFA 热键。
+- AFA 负责：自动开局暂停、普通暂停、普通恢复、暂停技能、暂停撤退；逐帧所有权后来由 ADR-0010
+  从 Rust 改为 AFA `33ms`。
+- Rust 负责：部署拖拽、鼠标定位/停靠、发送一次 AFA 热键。
 - 用户必须先进入关卡并等待 AFA 自动暂停，再点击“开始复刻”；开始预检只接受可信、战斗内、
   带 `frame_id` 的第 0 帧 `1x_paused` 尺子样本。非零帧必须走后续新增的风险确认式“继续”。
   `AutoBeginPause` 必须为 `1`；AFA 未自动暂停时开始请求直接被拒绝，不补发开局热键。
@@ -149,7 +212,7 @@ M8 为 `real-machine verified`；代码与知识为本地已验证并闭环。M9
 - AFA 不可用、退出、降权、配置指纹变化或游戏失焦时，复刻器失败关闭；禁止回退旧 Rust
   技能/撤退三触控、Hover、固定长按等时序，也禁止静默重试。
 - `Output` 和 `Finish` 都是零输入；旧 `after_last_action` 只兼容解析，不改变收尾行为。
-- `initial_gap_ms` 继续只服务直接脉冲，不参与 AFA 委托动作。
+- `initial_gap_ms` 后来由 ADR-0010 降为旧配置兼容字段，不参与主复刻。
 
 ### 2. ConfirmingAction 的确认窗口
 
@@ -221,13 +284,16 @@ M8 为 `real-machine verified`；代码与知识为本地已验证并闭环。M9
   手动焦点交接、已有档案自动恢复、paused 首样本人工绑定、running 首样本无档案安全中止，以及
   Deploy/Skill/Retreat 全流程。每个运行区间只能派发一次 Resume/Pause，跨帧数必须为 0，最后动作
   后必须停在目标帧 `1x_paused` 且 Finish 零输入。外部程序只由用户操作。
-- [ ] M9：M8 通过后用录像和 CSV 连续核对 10 轮，要求所有动作生效帧 10/10 与作业完全一致。
+- [x] M8A：新增独立 `afa-step-test` A/B 诊断工具；当时 `33ms` 仍为可选绑定。该决定已由
+  ADR-0010 修订：主复刻现已使用同一热键，并将它列为预检必需项。
+- [x] M9：2026-07-30 用户确认当前 AFA 逐帧构建完成录像和 CSV 连续 10 轮，动作生效帧 10/10
+  与作业一致；录像、CSV 和日志未纳入仓库。
 
 ## 实机验收入口
 
 1. 用户启动管理员权限的 AFA、ArknightsCostBarRuler 和《明日方舟》PC 客户端。
 2. 首次预检核对当前 AFA 配置（本项目验收 profile 的预期值；不是 AFA 源码默认值）：
-   `PressPause=g`、`ReleasePause=Space`、`PauseSkill=XButton2`、`PauseRetreat=XButton1`、
+   `PressPause=g`、`ReleasePause=Space`、`PauseSkill=XButton2`、`PauseRetreat=XButton1`、`33ms=r`、
    `AutoBeginPause=1`、`DefaultStrongHoldProtocol=0`。若本 profile 的实际值不同，先在 AFA
    界面完成配置并重新预检；复刻器不修改 INI。若其他实际值不同，先记录实际
    值并停止本轮验收；只有协议键名/格式与源码不一致时才调整适配器集中常量/解析，不改 AFA 配置。
@@ -240,30 +306,33 @@ M8 为 `real-machine verified`；代码与知识为本地已验证并闭环。M9
 
 ## 已验证证据
 
-- `cargo test -p repl-input`：34 个测试通过，包含 AFA UTF-16 LE/BE INI 回归覆盖。
+- `cargo test -p repl-input`：现役 35 个测试通过，包含 AFA UTF-16 LE/BE INI 和必需 `33ms` 回归覆盖。
 - `cargo test -p repl-app`：历史阶段 25 个测试通过；新增目标 10、尺子最新 11 时禁止派发、目标帧最新可信
   样本允许派发，以及 Session 准备动作期间从 10 前进到 11 时由最终输入边界拒绝的回归覆盖。
 - `cargo check -p repl-app`：通过。
 - `cargo test --workspace`：该阶段通过（各 crate 全部测试和 doctest 通过；当时 `repl-input` 34 项，
   `repl-core` 100 项，`repl-app` 25 项）。现役总数见本计划顶部收尾记录。
+- 2026-07-30 现役门禁：`repl-app` 库31项、主程序5项、`repl-core` 113项、`repl-input` 35项、
+  `afa-step-test` 1项及其余工作区测试/doctest 全部通过；全工作区 Clippy、release 构建、格式和
+  `git diff --check` 通过。标准路径二进制哈希见顶部阶段记录。
 - `cargo clippy --workspace --all-targets -- -D warnings`：通过。
 - `cargo build --release`：通过。
 - `cargo fmt --all`、`git diff --check`：通过。
 - 历史实机日志曾暴露动作前越帧、Pulse 旧 paused、Pause 样本计数和 Resume 重发问题；这些问题
   已分别由 ADR 0002–0005 的代码修复和回归测试覆盖。当前构建 M8 已于 2026-07-29 由用户按
-  `docs/REAL_MACHINE_ACCEPTANCE.md` 确认通过；M9 证据仍须按该文档生成。
+  `docs/REAL_MACHINE_ACCEPTANCE.md` 确认通过；2026-07-30 用户进一步确认当前构建 M9 10/10 通过。
 
 ## 风险、发现与结果记录
 
 - AFA 热键没有回执；尺子确认只能证明派发后停在目标帧，技能/撤退的画面效果仍需用户录像确认。
-- AFA 第 0 帧暂停可能冻结费用条渐显，第一条可信读数曾到第 33 帧；正式验收作业首动作至少第
-  60 帧，`examples/sample-job.json` 只用于早帧时序回归。
+- 作业首动作没有第 60 帧下限；`examples/sample-job.json` 的 10/40/60 序列可用于精确链路验收。
+  接管或运行期 Pause 越过下一动作时仍必须按尺子实际读数安全中止。
 - 用户 AFA INI 实测为 UTF-16 LE；读取器已按 BOM 支持 UTF-8、UTF-16 LE/BE，始终只读。
-- `Settings.ini` 的四个键名已由同工作区 AFA 源码确认，但实际值、热键捕获和动作效果仍必须由首次
+- `Settings.ini` 的五个热键键名已由同工作区 AFA 源码确认，但实际值、热键捕获和动作效果仍必须由首次
   实机日志校验；发现协议格式不一致时先停用委托，不做兼容性猜测。
 - 游戏失焦、AFA 重启、配置改动和非 1x 状态都视为不可恢复的本次运行失败。
 - 动作前尺子权威、Pulse 收尾、Pause 宽限和 Resume running 回执的根因与决定分别记录在 ADR
-  0002–0005；当前实现已有回归测试且 M8 实机通过。M9 通过前仍不能宣称 10/10 帧精度完成。
+  0002–0005；当前实现已有回归测试，M8 与 M9 均已由用户实机确认通过。
 - 父目录旧二进制和早于当前验收构建的日志不能作为证据；当前验收对象及 SHA-256 以
   `docs/REAL_MACHINE_ACCEPTANCE.md` 为准。
 - 每个里程碑完成后更新 `docs/CURRENT_STATE.md`；长期边界变化才新增 ADR，不把聊天记录当状态。

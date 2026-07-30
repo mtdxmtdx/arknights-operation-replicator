@@ -466,18 +466,6 @@ impl JobDocument {
                 _ => {}
             }
         }
-        if actions
-            .iter()
-            .filter_map(|action| action.frame)
-            .next()
-            .is_some_and(|frame| frame < 60)
-        {
-            diagnostics.push(Diagnostic::warning(
-                None,
-                "actions[0].frame",
-                "首动作早于第 60 帧，可能撞上开局费用条盲区",
-            ));
-        }
         if !diagnostics
             .iter()
             .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
@@ -763,13 +751,13 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_include_early_frame_warning_without_blocking_compile() {
+    fn diagnostics_allow_early_frame_without_obsolete_blind_spot_warning() {
         let early = JOB.replace("\"frame\": 60", "\"frame\": 10");
         let document = JobDocument::parse(&early).unwrap();
-        assert!(document
+        assert!(!document
             .diagnostics()
             .iter()
-            .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Warning));
+            .any(|diagnostic| diagnostic.message.contains("第 60 帧")));
         assert!(document.compile().is_ok());
     }
 
