@@ -6,6 +6,8 @@
 //! 循环本身很薄 —— 所有判断逻辑都在 `repl-core::machine` 里（那部分可以离线回放测试），
 //! 这里只负责"接指令 → 干活 → 回报"。
 
+#![allow(clippy::empty_line_after_doc_comments)]
+
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -16,6 +18,7 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use repl_core::{
+    continuation::ContinuationPlan,
     machine::{AbortReason, Command, Completion, FrameView, Machine, Phase},
     ActionType, Copilot,
 };
@@ -25,7 +28,55 @@ use repl_input::{precise_sleep, TimerResolution};
 use crate::{config::Config, session::Session};
 
 /// 编队绑定回调：拿到会话去做识别和交互，返回 `true` 表示绑定完成。
-type Binder<'a> = Box<dyn FnMut(&mut Session) -> Result<bool> + 'a>;
+/// Whether the binding callback may ask the user to fill the binding panel.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BindingMode {
+    AutomaticOnly,
+    InteractiveAllowed,
+}
+
+/// A new execution session always starts in one of these two modes.
+#[derive(Clone, Debug)]
+pub enum RunMode {
+    /// Normal, precise replication requested while the ruler is paused at frame 0.
+    FromZero,
+    /// Risk-accepted continuation from a frozen, user-confirmed cutoff.
+    Continue(ContinuationPlan),
+}
+
+impl RunMode {
+    pub fn assumed_action_count(&self) -> usize {
+        match self {
+            Self::FromZero => 0,
+            Self::Continue(plan) => plan.assumed_action_count(),
+        }
+    }
+}
+
+/// Binding callback. The cancellation flag is passed through so a waiting panel can stop
+/// promptly when the user presses Stop.
+type StartupBinder<'a> =
+    Box<dyn FnMut(&mut Session, BindingMode, &AtomicBool) -> Result<bool> + 'a>;
+
+/// Startup progress before the state machine receives its takeover sample.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartupPhase {
+    WaitingGameFocus,
+    BindingFormation,
+    WaitingFinalFocus,
+    VerifyingTakeover,
+}
+
+impl StartupPhase {
+    pub const fn zh(self) -> &'static str {
+        match self {
+            Self::WaitingGameFocus => "等待游戏回到前台",
+            Self::BindingFormation => "准备编队绑定",
+            Self::WaitingFinalFocus => "等待最终焦点交接",
+            Self::VerifyingTakeover => "验证接管样本",
+        }
+    }
+}
 
 /// 编队绑定面板需要展示的一张卡片。
 #[derive(Clone, Debug)]
@@ -40,6 +91,9 @@ pub struct BindingCardInfo {
 /// 运行期发给 UI 的进度事件。
 #[derive(Clone, Debug)]
 pub enum Progress {
+    Startup {
+        phase: StartupPhase,
+    },
     Phase {
         phase: Phase,
         cursor: i64,
@@ -63,12 +117,13 @@ pub enum Progress {
         pulses: u32,
         zero_pulses: u32,
         overshoots: u32,
+        assumed_actions: usize,
+        continued: bool,
     },
     Failed(String),
 }
 
 /// 等待开局的总超时。
-const ARM_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// 逐帧推进阶段每次脉冲前的等待时长。
 ///
@@ -86,33 +141,45 @@ const PRE_ACTION_PAUSE: Duration = Duration::from_secs(2);
 const ACTION_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// AFA 自动开局暂停被尺子确认后，开始编队和后续动作前的稳定等待。
-const OPENING_PAUSE_SETTLE: Duration = Duration::from_secs(1);
 
 /// 编队绑定面板关闭后，等待用户把游戏恢复到前台的上限。
 const GAME_FOCUS_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// After focus is observed, require a newer authoritative ruler sample before takeover.
+const POST_FOCUS_SAMPLE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// 一次复刻运行。
 pub struct Runner<'a> {
     machine: Machine,
+    run_mode: RunMode,
     session: &'a mut Session,
     frames: &'a dyn FrameSource,
     events: mpsc::Sender<Progress>,
     cancel: Arc<AtomicBool>,
-    binder: Binder<'a>,
+    binder: StartupBinder<'a>,
 }
 
 impl<'a> Runner<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         copilot: Copilot,
         config: &Config,
+        run_mode: RunMode,
         session: &'a mut Session,
         frames: &'a dyn FrameSource,
         events: mpsc::Sender<Progress>,
         cancel: Arc<AtomicBool>,
-        binder: Binder<'a>,
+        binder: StartupBinder<'a>,
     ) -> Self {
+        let machine = match &run_mode {
+            RunMode::FromZero => Machine::with_gap(copilot, config.initial_gap_ms),
+            RunMode::Continue(plan) => {
+                Machine::with_continuation(copilot, plan, config.initial_gap_ms)
+            }
+        };
         Self {
-            machine: Machine::with_gap(copilot, config.initial_gap_ms),
+            machine,
+            run_mode,
             session,
             frames,
             events,
@@ -126,12 +193,21 @@ impl<'a> Runner<'a> {
     /// 整个过程持有 1ms 定时器精度 —— 这是进程级全局设置，会略微拉高整机功耗，
     /// 所以只在真正做帧操作的时段持有，跑完立刻释放。
     pub fn run(&mut self) -> Result<()> {
-        let _timer = TimerResolution::acquire();
-        self.machine.start();
+        let result = self.prepare_takeover().and_then(|takeover| {
+            if !self.machine.take_over(&takeover) {
+                let reason = self.machine.abort_reason().cloned().unwrap_or_else(|| {
+                    AbortReason::ExecutionFailed("接管样本未能初始化状态机".into())
+                });
+                return Err(anyhow!("{reason}"));
+            }
 
-        let result = self.pump();
+            // Timer resolution is only needed once real frame work begins. Startup waits
+            // deliberately do not change the process-wide timer setting.
+            let _timer = TimerResolution::acquire();
+            self.pump()
+        });
 
-        // 无论成败都把可能卡住的触点抬起来。
+        // 无论成功还是失败，都抬起可能卡住的触控输入。
         self.session.release_inputs();
 
         match &result {
@@ -141,6 +217,8 @@ impl<'a> Runner<'a> {
                     pulses: t.pulses,
                     zero_pulses: t.zero_frame_pulses,
                     overshoots: t.overshoot_pulses,
+                    assumed_actions: self.run_mode.assumed_action_count(),
+                    continued: matches!(&self.run_mode, RunMode::Continue(_)),
                 });
             }
             Err(e) => {
@@ -161,8 +239,6 @@ impl<'a> Runner<'a> {
                 Command::Idle => return Ok(()),
 
                 Command::Abort(reason) => return Err(anyhow!("{reason}")),
-
-                Command::ArmBattleStart => self.arm_battle_start()?,
 
                 Command::Pause => {
                     log::info!(
@@ -195,27 +271,7 @@ impl<'a> Runner<'a> {
                     self.machine.completed(Completion::PulseSent);
                 }
 
-                Command::AwaitFrame { timeout } => {
-                    let confirming_opening_pause = self.machine.phase() == Phase::ConfirmingZero;
-                    self.await_frame(timeout)?;
-                    if confirming_opening_pause && self.machine.phase() == Phase::BindingFormation {
-                        self.note("AFA 开局暂停已确认，等待 1 秒后继续后续操作".into());
-                        precise_sleep(OPENING_PAUSE_SETTLE);
-                    }
-                }
-
-                Command::BindFormation => {
-                    // NeedsBinding 事件由 binder 自己发（只有它知道扫出了哪些卡片）。
-                    let done = (self.binder)(self.session)?;
-                    if !done {
-                        return Err(anyhow!("编队绑定未完成，复刻中止"));
-                    }
-                    self.restore_game_foreground()?;
-                    // 用户刚在我们的窗口里点过"确认"，鼠标位置不可控 ——
-                    // 停回安全区，防止它落在费用条上把尺子的分析冻住。
-                    self.session.park_cursor();
-                    self.machine.completed(Completion::FormationBound);
-                }
+                Command::AwaitFrame { timeout } => self.await_frame(timeout)?,
 
                 Command::Execute { index } => {
                     let action = self.machine.copilot().actions[index].clone();
@@ -286,32 +342,211 @@ impl<'a> Runner<'a> {
     }
 
     /// 绑定面板会短暂夺走前台。这里只尝试一次系统前台切换；失败后等待用户手动
-    /// 点击游戏，不在动作委托阶段偷偷抢焦点或重发热键。
-    fn restore_game_foreground(&mut self) -> Result<()> {
-        if self.session.window.is_foreground() {
-            return Ok(());
+    fn prepare_takeover(&mut self) -> Result<FrameView> {
+        let next_action = self
+            .machine
+            .target()
+            .ok_or_else(|| anyhow!("作业没有可执行动作"))?;
+
+        let initial = self
+            .frames
+            .latest()
+            .ok_or_else(|| anyhow!("开始前没有收到尺子样本，请确认尺子已连接"))?;
+        let initial_view = to_view(&initial);
+        if initial.frame_id.is_none() {
+            return Err(anyhow!(
+                "开始请求被拒绝：尺子首样本缺少 frame_id，无法建立焦点交接水位"
+            ));
         }
-        let _ = self.session.window.focus();
+        match &self.run_mode {
+            RunMode::FromZero if !start_sample_ready(&initial_view, next_action) => {
+                return Err(anyhow!(
+                    "开始请求被拒绝：需要可信、战斗内、1x_paused 且 elapsed=0，当前 state={} trustworthy={} paused={:?} elapsed={}",
+                    initial_view.battle_state,
+                    initial_view.trustworthy,
+                    initial_view.paused,
+                    initial_view.elapsed,
+                ));
+            }
+            RunMode::Continue(plan)
+                if !continuation_sample_ready(&initial_view)
+                    || initial_view.elapsed < plan.cutoff_frame
+                    || initial_view.elapsed > next_action =>
+            {
+                return Err(anyhow!(
+                    "继续请求被拒绝：冻结截止帧={}，下一动作帧={}，当前 state={} trustworthy={} paused={:?} elapsed={}",
+                    plan.cutoff_frame,
+                    next_action,
+                    initial_view.battle_state,
+                    initial_view.trustworthy,
+                    initial_view.paused,
+                    initial_view.elapsed,
+                ));
+            }
+            _ => {}
+        }
+
+        let focus_watermark = initial_view.frame_id;
+        self.emit_startup(StartupPhase::WaitingGameFocus);
+        self.note(format!(
+            "开始请求已接受；等待用户手动将游戏切回前台（ruler watermark={focus_watermark}）"
+        ));
+        self.wait_for_game_focus()?;
+        self.session.park_cursor();
+
+        let first_focus_sample = self.wait_for_takeover_sample(focus_watermark, next_action)?;
+        let binding_mode = if first_focus_sample.paused == Some(true) {
+            BindingMode::InteractiveAllowed
+        } else {
+            self.note("焦点后的第一条可信样本为 1x_running；本轮只允许自动恢复编队绑定".into());
+            BindingMode::AutomaticOnly
+        };
+
+        self.emit_startup(StartupPhase::BindingFormation);
+        if !(self.binder)(self.session, binding_mode, &self.cancel)? {
+            return Err(anyhow!("编队绑定未完成，复刻中止"));
+        }
+        self.session.park_cursor();
+
+        self.emit_startup(StartupPhase::WaitingFinalFocus);
+        self.note("编队准备完成；请再次将游戏切回前台".into());
+        let final_focus_watermark = self.latest_frame_id();
+        self.wait_for_game_focus()?;
+        self.session.park_cursor();
+
+        self.emit_startup(StartupPhase::VerifyingTakeover);
+        self.wait_for_takeover_sample(final_focus_watermark, next_action)
+    }
+
+    fn latest_frame_id(&self) -> u64 {
+        self.frames
+            .latest()
+            .and_then(|snapshot| snapshot.frame_id)
+            .unwrap_or(0)
+    }
+
+    fn wait_for_game_focus(&mut self) -> Result<()> {
         let deadline = Instant::now() + GAME_FOCUS_TIMEOUT;
         while Instant::now() < deadline {
             if self.cancel.load(Ordering::Relaxed) {
-                return Err(anyhow!("用户在等待游戏前台时中止复刻"));
+                return Err(anyhow!("{}", AbortReason::UserAborted));
             }
             if self.session.window.is_foreground() {
+                self.note("检测到游戏窗口已回到前台".into());
                 return Ok(());
             }
             precise_sleep(Duration::from_millis(100));
         }
         Err(anyhow!(
-            "编队绑定后游戏窗口仍不在前台；请点击游戏窗口后重新开始"
+            "等待游戏窗口回到前台超时（{} 秒）；复刻器没有自动抢回游戏焦点",
+            GAME_FOCUS_TIMEOUT.as_secs()
         ))
     }
 
-    /// 确认一次真实输入已经收尾：只接受动作派发后的新样本，且样本必须显示暂停。
-    ///
-    /// 注意 `Snapshot::is_running` 是尺子的费用条识别管线状态，不是战斗是否运行；
-    /// 这里用 `FrameView::paused == Some(false)` 判定游戏运行态。任何运行态样本
-    /// 都直接失败，不能把它当作“短暂过渡”而继续等，否则可能已经越过目标帧。
+    fn wait_for_takeover_sample(
+        &mut self,
+        min_frame_id: u64,
+        next_action: i64,
+    ) -> Result<FrameView> {
+        let deadline = Instant::now() + POST_FOCUS_SAMPLE_TIMEOUT;
+        let mut after_frame_id = min_frame_id;
+        loop {
+            if self.cancel.load(Ordering::Relaxed) {
+                return Err(anyhow!("{}", AbortReason::UserAborted));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let latest = self.frames.latest();
+                return Err(anyhow!(
+                    "焦点交接后 {} 秒内没有收到新的可信 1x 样本（min_frame_id={}，当前 state={} elapsed={})",
+                    POST_FOCUS_SAMPLE_TIMEOUT.as_secs(),
+                    min_frame_id,
+                    latest
+                        .as_ref()
+                        .map_or("<无快照>".to_owned(), |snapshot| snapshot.battle_state_str().to_owned()),
+                    latest.as_ref().map_or(-1, |snapshot| snapshot.total_elapsed_frames),
+                ));
+            }
+
+            match self
+                .frames
+                .wait_next(after_frame_id, remaining.min(Duration::from_millis(200)))
+            {
+                Ok(snapshot) => {
+                    let Some(frame_id) = snapshot.frame_id else {
+                        continue;
+                    };
+                    if frame_id <= after_frame_id {
+                        continue;
+                    }
+                    after_frame_id = frame_id;
+                    let view = to_view(&snapshot);
+                    if !view.trustworthy {
+                        log::debug!(
+                            "takeover sample ignored: frame_id={} state={} is untrustworthy",
+                            view.frame_id,
+                            view.battle_state
+                        );
+                        continue;
+                    }
+                    if !view.in_battle {
+                        return Err(anyhow!(
+                            "{}",
+                            AbortReason::LeftBattle {
+                                state: view.battle_state.clone()
+                            }
+                        ));
+                    }
+                    if !view.one_x {
+                        return Err(anyhow!(
+                            "{}",
+                            AbortReason::NotOneX {
+                                state: view.battle_state.clone()
+                            }
+                        ));
+                    }
+                    if view.paused.is_none() {
+                        log::debug!(
+                            "takeover sample ignored: frame_id={} state={} pause state unknown",
+                            view.frame_id,
+                            view.battle_state
+                        );
+                        continue;
+                    }
+                    let minimum = self.machine.continuation_cutoff().unwrap_or(0);
+                    if view.elapsed < minimum {
+                        return Err(anyhow!(
+                            "继续接管样本倒退到冻结截止帧之前：当前第 {} 帧，冻结截止帧 {}",
+                            view.elapsed,
+                            minimum,
+                        ));
+                    }
+                    if view.elapsed > next_action {
+                        return Err(anyhow!(
+                            "{}",
+                            AbortReason::MissedStart {
+                                takeover_frame: view.elapsed,
+                                first_action: next_action,
+                            }
+                        ));
+                    }
+                    self.note(format!(
+                        "接管样本通过：frame_id={} state={} elapsed={} paused={:?} watermark={min_frame_id}",
+                        view.frame_id, view.battle_state, view.elapsed, view.paused,
+                    ));
+                    return Ok(view);
+                }
+                Err(FrameError::Timeout(_)) => continue,
+                Err(error) => return Err(anyhow!("焦点交接后读取尺子失败：{error}")),
+            }
+        }
+    }
+
+    fn emit_startup(&self, phase: StartupPhase) {
+        log::info!("startup phase: {}", phase.zh());
+        let _ = self.events.send(Progress::Startup { phase });
+    }
+
     fn confirm_action(&mut self, action_frame: i64, min_frame_id: u64) -> Result<()> {
         let (frame_id, view) = wait_for_action_confirmation(
             self.frames,
@@ -344,112 +579,9 @@ impl<'a> Runner<'a> {
         let _ = self.events.send(Progress::Log(message));
     }
 
-    /// 等待战斗开始。开局暂停完全由 AFA 的自动开局暂停负责；这里仅用尺子确认战斗与暂停状态，
-    /// 绝不发送开局暂停输入。像素检测只用于进度和尺子健康提示。
+    /// 运行期等待尺子样本。开局接管已经在 [`Self::prepare_takeover`] 完成；
+    /// 这里仅处理巡航、暂停确认和脉冲收尾，绝不发送开局暂停输入。
     ///
-    /// 像素检测（倍速按钮区变白）降级为纯进度提示，不再驱动任何按键。
-    fn arm_battle_start(&mut self) -> Result<()> {
-        // 防呆：如果此刻已经身处战斗中（比如刚跑完 step-test 没退出来），
-        // 后续的"开局暂停"语义就全错了。明确拒绝，让用户从关卡准备界面开始。
-        if let Some(snapshot) = self.frames.latest() {
-            let view = to_view(&snapshot);
-            if view.trustworthy && view.in_battle {
-                return Err(anyhow!(
-                    "看起来已经在战斗中（{}，第 {} 帧）。请先退出本场战斗，\
-                     从关卡准备界面点「开始复刻」再进关",
-                    view.battle_state,
-                    view.elapsed
-                ));
-            }
-        }
-
-        self.note("等待开局中，请进入关卡…".into());
-        let deadline = Instant::now() + ARM_TIMEOUT;
-        // 我们自己看到战斗画面的时刻 + 当时尺子的分析帧号。
-        // 两者配合是尺子健康度的试金石：战斗画面在动，尺子的 frameId 就必须在涨。
-        let mut hud_seen: Option<(Instant, u64)> = None;
-        /// 看到战斗画面后给尺子的宽限期。
-        const RULER_GRACE: Duration = Duration::from_secs(10);
-
-        while Instant::now() < deadline {
-            if self.cancel.load(Ordering::Relaxed) {
-                return Err(anyhow!("{}", AbortReason::UserAborted));
-            }
-
-            // 进度提示：看到战斗画面的迹象就告诉用户"快了"。
-            // 只做提示，不驱动按键；截图失败（静止画面上 WGC 不产帧）也无所谓。
-            if hud_seen.is_none() {
-                if let Ok(frame) = self.session.capture() {
-                    if speed_box_lit(&frame) {
-                        let ruler_id = self.frames.latest().and_then(|s| s.frame_id).unwrap_or(0);
-                        hud_seen = Some((Instant::now(), ruler_id));
-                        self.note("检测到战斗画面，等待 AFA 自动开局暂停…".into());
-                    }
-                }
-            }
-
-            // 尺子健康检查：战斗画面已经出现（屏幕在动、WGC 在产帧），
-            // 尺子却迟迟给不出可信的战斗内样本 —— 按帧号是否在涨分两种病，
-            // 各给一条能直接照做的处置指引，而不是笼统的"等待超时"。
-            if let Some((since, id_at_hud)) = hud_seen {
-                if since.elapsed() > RULER_GRACE {
-                    let latest = self.frames.latest();
-                    let now_id = latest.as_ref().and_then(|s| s.frame_id).unwrap_or(0);
-                    let state = latest.as_ref().map_or("<无快照>".to_owned(), |s| {
-                        s.battle_state_str().to_owned()
-                    });
-                    if now_id == id_at_hud {
-                        return Err(anyhow!(
-                            "战斗画面已出现 {} 秒，但尺子的分析帧号一直卡在 {now_id} 不动 \
-                             —— 它的截图管线已经停滞（通常是游戏窗口重建后尺子还盯着旧窗口）。\
-                             请重启尺子（保持游戏开着），确认其悬浮窗的帧数在战斗中会走动，再重试",
-                            RULER_GRACE.as_secs()
-                        ));
-                    }
-                    return Err(anyhow!(
-                        "战斗画面已出现 {} 秒，尺子在分析（帧号 {id_at_hud} → {now_id}）\
-                         但始终没有给出可信的战斗内样本（当前 state={state}）。\
-                         检查尺子的捕获目标是否是游戏窗口、校准配置是否匹配当前分辨率",
-                        RULER_GRACE.as_secs()
-                    ));
-                }
-            }
-
-            // 只检测尺子的第一条可信战斗内样本；暂停输入完全由 AFA 自动开局暂停负责。
-            // 用 wait_next（而不是 latest()）让尺子客户端进入主动轮询模式，
-            // 不依赖"状态变化才推送"的语义。
-            match self
-                .frames
-                .wait_next(self.machine.last_frame_id(), Duration::from_millis(100))
-            {
-                Ok(snapshot) => {
-                    let view = to_view(&snapshot);
-                    let accepted = self.machine.observe(&view);
-                    if self.machine.phase() == Phase::Aborted {
-                        return Err(anyhow!("{}", self.machine.abort_reason().unwrap()));
-                    }
-                    if accepted && view.in_battle {
-                        log::info!(
-                            "battle start detected by ruler; waiting for AFA automatic pause: state={} elapsed={} frame_id={}",
-                            view.battle_state,
-                            view.elapsed,
-                            view.frame_id
-                        );
-                        self.machine.completed(Completion::OpeningPauseDelegated);
-                        // 用户刚点过"开始行动"，鼠标还停在按钮那儿；从现在起帧数
-                        // 完全依赖尺子读费用条，必须立刻把鼠标挪去安全区。
-                        self.session.park_cursor();
-                        return Ok(());
-                    }
-                }
-                Err(FrameError::Timeout(_)) => {}
-                Err(e) => return Err(anyhow!("{e}")),
-            }
-        }
-        Err(anyhow!("等待开局超时（5 分钟）"))
-    }
-
-    /// 等一条新的、可信的尺子样本。
     fn await_frame(&mut self, timeout: Duration) -> Result<()> {
         let mut deadline = Instant::now() + timeout;
         // 鼠标遮挡费用条导致的等待失败可以自愈一次：挪开鼠标、重置期限重等。
@@ -772,36 +904,41 @@ fn classify_action_sample(view: &FrameView, action_frame: i64) -> ActionSampleDe
 /// 倍速按钮区域是否出现近白像素（AFA `SpeedButtonPositionColor` 的采样区）。
 ///
 /// 只是**粗筛**：准备界面 / 加载画面上的白色元素也会命中，必须再过
-/// [`repl_vision::battle_hud_visible`] 的硬确认才能当作开局。
-fn speed_box_lit(frame: &repl_capture::Frame) -> bool {
-    const LEFT: f64 = 0.8450;
-    const RIGHT: f64 = 0.8807;
-    const TOP: f64 = 0.0713;
-    const BOTTOM: f64 = 0.0870;
-    /// AFA 的 PixelSearch 容差。
-    const TOLERANCE: i32 = 10;
-
-    let w = f64::from(frame.width);
-    let h = f64::from(frame.height);
-    let (x0, x1) = ((w * LEFT) as i32, (w * RIGHT) as i32);
-    let (y0, y1) = ((h * TOP) as i32, (h * BOTTOM) as i32);
-
-    for y in (y0..y1).step_by(2) {
-        for x in (x0..x1).step_by(2) {
-            if let Some([r, g, b]) = frame.rgb(x, y) {
-                if i32::from(r) >= 255 - TOLERANCE
-                    && i32::from(g) >= 255 - TOLERANCE
-                    && i32::from(b) >= 255 - TOLERANCE
-                {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+/// Whether the Start button's live precondition is satisfied.
+pub fn start_sample_ready(view: &FrameView, _first_action: i64) -> bool {
+    view.trustworthy
+        && view.in_battle
+        && view.one_x
+        && view.paused == Some(true)
+        && view.elapsed == 0
 }
 
-/// 尺子快照 → 状态机视图。
+/// UI/启动入口的完整预检；没有 `frame_id` 就不能建立“焦点后新样本”的水位。
+pub fn start_snapshot_ready(snapshot: &Snapshot, first_action: i64) -> bool {
+    snapshot.frame_id.is_some() && start_sample_ready(&to_view(snapshot), first_action)
+}
+
+/// Continue may be proposed at any positive authoritative paused frame. Whether an action
+/// remains is a property of the job and is checked by [`ContinuationPlan::build`].
+pub fn continuation_sample_ready(view: &FrameView) -> bool {
+    view.trustworthy
+        && view.in_battle
+        && view.one_x
+        && view.paused == Some(true)
+        && view.elapsed > 0
+}
+
+pub fn continuation_snapshot_plan(
+    snapshot: &Snapshot,
+    copilot: &Copilot,
+) -> Option<ContinuationPlan> {
+    snapshot.frame_id?;
+    let view = to_view(snapshot);
+    continuation_sample_ready(&view)
+        .then(|| ContinuationPlan::build(copilot, view.elapsed).ok())
+        .flatten()
+}
+
 pub fn to_view(snapshot: &Snapshot) -> FrameView {
     let state = snapshot.battle_state.as_ref();
     FrameView {
@@ -837,6 +974,44 @@ mod tests {
         assert_eq!(v.paused, Some(true));
         assert!(v.one_x);
         assert!(v.trustworthy);
+    }
+
+    #[test]
+    fn start_sample_requires_authoritative_paused_battle_at_zero() {
+        let paused = to_view(&snapshot_json("1x_paused", 0, 7, true));
+        assert!(start_sample_ready(&paused, 10));
+
+        let running = to_view(&snapshot_json("1x_running", 0, 7, true));
+        assert!(!start_sample_ready(&running, 10));
+
+        let late = to_view(&snapshot_json("1x_paused", 1, 7, true));
+        assert!(!start_sample_ready(&late, 10));
+    }
+
+    #[test]
+    fn continuation_requires_positive_authoritative_paused_frame_and_remaining_action() {
+        let job = Copilot::parse(include_str!("../../../examples/test1.json")).unwrap();
+        let frame_one = snapshot_json("1x_paused", 1, 7, true);
+        let plan = continuation_snapshot_plan(&frame_one, &job).unwrap();
+        assert_eq!(plan.next_action_index, 0);
+
+        let frame_eleven = snapshot_json("1x_paused", 11, 8, true);
+        let plan = continuation_snapshot_plan(&frame_eleven, &job).unwrap();
+        assert_eq!(plan.next_action_index, 1);
+
+        assert!(
+            continuation_snapshot_plan(&snapshot_json("1x_running", 11, 9, true), &job).is_none()
+        );
+        assert!(
+            continuation_snapshot_plan(&snapshot_json("1x_paused", 249, 10, true), &job).is_none()
+        );
+    }
+
+    #[test]
+    fn start_snapshot_requires_frame_id_for_focus_watermark() {
+        let mut snapshot = snapshot_json("1x_paused", 10, 7, true);
+        snapshot.frame_id = None;
+        assert!(!start_snapshot_ready(&snapshot, 10));
     }
 
     #[test]

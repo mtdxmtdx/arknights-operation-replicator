@@ -154,16 +154,24 @@ impl Session {
 
     /// 从保存的档案恢复绑定。
     pub fn restore_binding(&mut self, binding: &Binding, avatar_bgra: &[u8]) -> Result<()> {
-        let template = Template::from_bgra(
-            binding.name.clone(),
-            binding.width,
-            binding.height,
-            avatar_bgra,
-            None,
-        )
-        .map_err(|e| anyhow!("恢复干员「{}」的绑定失败：{e}", binding.name))?;
-        self.avatars.insert(binding.name.clone(), template);
+        self.restore_avatar(&binding.name, binding.width, binding.height, avatar_bgra)
+    }
+
+    pub fn restore_avatar(
+        &mut self,
+        name: &str,
+        width: u32,
+        height: u32,
+        avatar_bgra: &[u8],
+    ) -> Result<()> {
+        let template = Template::from_bgra(name.to_owned(), width, height, avatar_bgra, None)
+            .map_err(|e| anyhow!("恢复干员「{name}」的绑定失败：{e}"))?;
+        self.avatars.insert(name.to_owned(), template);
         Ok(())
+    }
+
+    pub fn seed_battlefield(&mut self, battlefield: impl IntoIterator<Item = (String, Point)>) {
+        self.battlefield = battlefield.into_iter().collect();
     }
 
     pub fn bound_names(&self) -> Vec<String> {

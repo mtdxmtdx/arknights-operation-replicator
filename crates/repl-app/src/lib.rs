@@ -4,10 +4,12 @@
 //! `repl-app` —— 编排层：把帧源、输入注入、识别、状态机接到一起。
 
 pub mod config;
+pub mod editor;
 pub mod runner;
 pub mod session;
 
 pub use config::{Binding, BindingProfile, BindingStore, Config};
+pub use editor::EditorState;
 pub use runner::{Progress, Runner};
 pub use session::Session;
 

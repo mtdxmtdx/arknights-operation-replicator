@@ -13,6 +13,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 
 pub const CONFIG_FILE: &str = "config.json";
@@ -117,11 +118,35 @@ pub struct BindingProfile {
     pub bindings: Vec<Binding>,
 }
 
+/// 跨编队保存的最近一次干员头像；用于“继续”时恢复暂时不在部署栏的干员。
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct StoredAvatar {
+    pub width: u32,
+    pub height: u32,
+    pub bgra_base64: String,
+}
+
+impl StoredAvatar {
+    pub fn from_bgra(width: u32, height: u32, bgra: &[u8]) -> Self {
+        Self {
+            width,
+            height,
+            bgra_base64: STANDARD.encode(bgra),
+        }
+    }
+
+    pub fn decode(&self) -> Result<Vec<u8>, base64::DecodeError> {
+        STANDARD.decode(&self.bgra_base64)
+    }
+}
+
 /// 所有已保存的绑定档案，按"编队指纹"索引。
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct BindingStore {
     #[serde(default)]
     pub profiles: BTreeMap<String, BindingProfile>,
+    #[serde(default)]
+    pub avatars: BTreeMap<String, StoredAvatar>,
 }
 
 impl BindingStore {
@@ -147,6 +172,21 @@ impl BindingStore {
 
     pub fn put(&mut self, fingerprint: String, profile: BindingProfile) {
         self.profiles.insert(fingerprint, profile);
+    }
+
+    pub fn remember_avatar(
+        &mut self,
+        name: impl Into<String>,
+        width: u32,
+        height: u32,
+        bgra: &[u8],
+    ) {
+        self.avatars
+            .insert(name.into(), StoredAvatar::from_bgra(width, height, bgra));
+    }
+
+    pub fn avatar(&self, name: &str) -> Option<&StoredAvatar> {
+        self.avatars.get(name)
     }
 }
 
@@ -333,9 +373,17 @@ mod tests {
                 }],
             },
         );
+        store.remember_avatar("山", 16, 16, &[1, 2, 3, 4]);
         let text = serde_json::to_string(&store).unwrap();
         let back: BindingStore = serde_json::from_str(&text).unwrap();
         assert_eq!(back.get("abc").unwrap().bindings[0].name, "山");
         assert!(back.get("nope").is_none());
+        assert_eq!(back.avatar("山").unwrap().decode().unwrap(), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn legacy_binding_store_without_avatar_library_still_loads() {
+        let store: BindingStore = serde_json::from_str(r#"{"profiles":{}}"#).unwrap();
+        assert!(store.avatars.is_empty());
     }
 }

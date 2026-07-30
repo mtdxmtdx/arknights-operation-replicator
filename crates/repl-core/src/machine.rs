@@ -12,8 +12,8 @@
 //! 离线回放，把"巡航 / 提前暂停 / 逐帧推进"的切换点全部测到。
 //!
 //! ```text
-//! 等待开局 → 第零帧暂停 → 编队匹配 → 正常运行 → 提前暂停 → 逐帧推进
-//!          → 到目标帧暂停 → 注入动作 → 下一动作 → … → 收尾
+//! 焦点交接/编队准备 → 接管样本 → 正常运行 → 提前暂停 → 逐帧推进
+//!                  → 到目标帧暂停 → 注入动作 → 下一动作 → … → 收尾
 //! ```
 
 use std::time::Duration;
@@ -21,6 +21,7 @@ use std::time::Duration;
 use crate::{
     copilot::{ActionType, Copilot},
     stepping::GapTuner,
+    ContinuationPlan,
 };
 
 /// 提前多少帧从"正常运行"切到"逐帧推进"。
@@ -62,12 +63,6 @@ pub struct FrameView {
 pub enum Phase {
     /// 还没开始。
     Idle,
-    /// 等待战斗开始。
-    WaitingBattle,
-    /// 已检测到战斗，等待 AFA 自动开局暂停产生可信的暂停态样本。
-    ConfirmingZero,
-    /// 编队匹配（用户把作业干员和部署栏卡片对上）。
-    BindingFormation,
     /// 正常运行，等着接近目标帧。
     Cruising,
     /// 已提前暂停，正在逐帧推进。
@@ -84,9 +79,6 @@ impl Phase {
     pub fn zh(self) -> &'static str {
         match self {
             Self::Idle => "空闲",
-            Self::WaitingBattle => "等待开局",
-            Self::ConfirmingZero => "确认开局暂停",
-            Self::BindingFormation => "编队匹配",
             Self::Cruising => "正常运行",
             Self::Stepping => "逐帧推进",
             Self::Injecting => "注入动作",
@@ -99,16 +91,12 @@ impl Phase {
 /// 状态机让调用方去做的事。
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
-    /// 等待战斗开始；检测到后由 AFA 的自动开局暂停负责停住游戏。
-    ArmBattleStart,
     /// 发暂停键。
     Pause,
     /// 发恢复键。
     Resume,
     /// 发一次逐帧脉冲。
     Pulse { gap: Duration },
-    /// 抓图并让用户完成编队绑定。
-    BindFormation,
     /// 执行第 `index` 个动作。
     Execute { index: usize },
     /// 等下一条尺子样本。
@@ -124,16 +112,12 @@ pub enum Command {
 /// 调用方对一条命令的回报。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Completion {
-    /// 已检测到战斗，开局暂停完全委托给 AFA；本完成事件本身不代表发送了输入。
-    OpeningPauseDelegated,
     /// 已发出一次运行期暂停键。
     PauseSent,
     /// 已发出恢复键。
     ResumeSent,
     /// 已发出一次逐帧脉冲。
     PulseSent,
-    /// 编队绑定完成。
-    FormationBound,
     /// 动作执行完毕。
     ActionExecuted,
 }
@@ -142,7 +126,10 @@ pub enum Completion {
 #[derive(Clone, Debug, PartialEq)]
 pub enum AbortReason {
     /// 开局暂停没赶上，第一个动作的帧号已经过去了。
-    MissedStart { origin: i64, first_action: i64 },
+    MissedStart {
+        takeover_frame: i64,
+        first_action: i64,
+    },
     /// 倍速不是 1x。
     NotOneX { state: String },
     /// 战斗已经结束或退出。
@@ -155,8 +142,6 @@ pub enum AbortReason {
     FrameTimeout,
     /// 暂停键没生效（多半是代理指挥 / 托管）。
     PauseIneffective,
-    /// AFA 没有在开局自动暂停。
-    OpeningPauseIneffective,
     /// 脉冲已经发出，但尺子长时间没有看到它回到暂停态。
     PulseDidNotSettle { state: String },
     /// 执行动作时出错。
@@ -169,11 +154,11 @@ impl std::fmt::Display for AbortReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MissedStart {
-                origin,
+                takeover_frame,
                 first_action,
             } => write!(
                 f,
-                "错过了开局：暂停时已经是第 {origin} 帧，但第一个动作在第 {first_action} 帧。\
+                "错过了首个动作：接管时已经是第 {takeover_frame} 帧，但第一个动作在第 {first_action} 帧。\
                  请退出重进关卡再试"
             ),
             Self::NotOneX { state } => write!(
@@ -205,10 +190,6 @@ impl std::fmt::Display for AbortReason {
                 f,
                 "发了暂停键但游戏仍在推进。如果开着代理指挥或托管，请先关掉"
             ),
-            Self::OpeningPauseIneffective => write!(
-                f,
-                "AFA 没有在开局自动暂停。请在 AFA 中启用自动开局暂停，并确认 AFA 正在运行"
-            ),
             Self::PulseDidNotSettle { state } => write!(
                 f,
                 "逐帧脉冲后迟迟没有恢复暂停（当前 {state}）。为避免重复切换导致超跑，复刻已中止"
@@ -225,10 +206,12 @@ pub struct Machine {
     phase: Phase,
     /// 当前已确认的绝对帧。
     cursor: i64,
-    /// 第零帧暂停时实际停在的帧号。
-    origin: i64,
+    /// 最终接管样本中的绝对帧号。
+    takeover_frame: i64,
     /// 下一个要执行的动作下标。
     action_index: usize,
+    /// 用户点击“继续”时冻结的风险截止帧；正常开始时为 None。
+    continuation_cutoff: Option<i64>,
     /// 游戏当前是否被我们停住了。
     paused: bool,
     /// 运行期 Resume 已发送，但还没有收到尺子的运行态确认。
@@ -254,14 +237,6 @@ pub struct Machine {
     tuner: GapTuner,
     abort: Option<AbortReason>,
 }
-
-/// 暂停后连续多少条**帧数仍在增长**的可信样本就判定暂停无效。
-///
-/// 不能取太小：从我们按下暂停键到尺子看见"帧数冻结"之间有一段固有延迟
-/// （按键被游戏下一个渲染 tick 处理 + 尺子按截图节奏分析，约 2–4 条样本），
-/// 这期间帧数**理应**还在增长。8 条 ≈ 130–260ms，既不会误杀正常暂停，
-/// 也能在半秒内识破真正的暂停失效（代理指挥 / 托管会一直涨下去）。
-const PAUSE_PROBE_LIMIT: u32 = 8;
 
 /// 接近目标帧时，显式 Pause 发出后最多允许游戏继续推进的逻辑帧数。
 /// 6 帧约 200ms，覆盖 AFA 的 50ms ESC 时序、游戏输入处理和尺子分析延迟；
@@ -291,8 +266,9 @@ impl Machine {
             copilot,
             phase: Phase::Idle,
             cursor: 0,
-            origin: 0,
+            takeover_frame: 0,
             action_index: 0,
+            continuation_cutoff: None,
             paused: false,
             resume_in_flight: false,
             pause_in_flight: false,
@@ -316,8 +292,87 @@ impl Machine {
         m
     }
 
-    pub fn start(&mut self) {
-        self.phase = Phase::WaitingBattle;
+    /// 从用户确认过的动作前缀之后建立一台新状态机。
+    pub fn with_continuation(
+        copilot: Copilot,
+        plan: &ContinuationPlan,
+        initial_gap_ms: u32,
+    ) -> Self {
+        let mut machine = Self::with_gap(copilot, initial_gap_ms);
+        machine.action_index = plan.next_action_index;
+        machine.continuation_cutoff = Some(plan.cutoff_frame);
+        machine
+    }
+
+    /// 以准备阶段结束后取得的最新尺子样本接管战斗。
+    ///
+    /// Runner 负责焦点交接、样本新旧水位和编队准备；Machine 在这里建立唯一的
+    /// 绝对帧起点。接管样本允许暂停或运行，但必须是可信的战斗内 1x 读数。
+    /// 返回 `false` 表示样本不满足接管条件，Machine 已进入中止态。
+    pub fn take_over(&mut self, view: &FrameView) -> bool {
+        if self.phase != Phase::Idle {
+            return false;
+        }
+        self.last_frame_id = view.frame_id;
+        if !view.trustworthy {
+            self.fail(AbortReason::ExecutionFailed(
+                "接管样本不可信，无法建立绝对帧起点".into(),
+            ));
+            return false;
+        }
+        if !view.in_battle {
+            self.fail(AbortReason::LeftBattle {
+                state: view.battle_state.clone(),
+            });
+            return false;
+        }
+        if !view.one_x {
+            self.fail(AbortReason::NotOneX {
+                state: view.battle_state.clone(),
+            });
+            return false;
+        }
+        if view.paused.is_none() {
+            self.fail(AbortReason::ExecutionFailed(
+                "接管样本无法判断游戏暂停状态".into(),
+            ));
+            return false;
+        }
+
+        let first = self
+            .target()
+            .expect("normal and continuation starts require a pending action");
+        if let Some(cutoff) = self.continuation_cutoff {
+            if view.elapsed < cutoff {
+                self.fail(AbortReason::FrameWentBackwards {
+                    from: cutoff,
+                    to: view.elapsed,
+                });
+                return false;
+            }
+        }
+        if view.elapsed > first {
+            self.fail(AbortReason::MissedStart {
+                takeover_frame: view.elapsed,
+                first_action: first,
+            });
+            return false;
+        }
+        self.cursor = view.elapsed;
+        self.takeover_frame = view.elapsed;
+        self.paused = view.paused == Some(true);
+        if view.elapsed != 0 {
+            log::warn!(
+                "battle takeover landed on frame {} instead of 0 (still fine)",
+                view.elapsed
+            );
+        }
+        self.phase = if first - self.cursor > FRAME_LEAD {
+            Phase::Cruising
+        } else {
+            Phase::Stepping
+        };
+        true
     }
 
     pub fn phase(&self) -> Phase {
@@ -328,8 +383,12 @@ impl Machine {
         self.cursor
     }
 
-    pub fn origin(&self) -> i64 {
-        self.origin
+    pub fn takeover_frame(&self) -> i64 {
+        self.takeover_frame
+    }
+
+    pub fn continuation_cutoff(&self) -> Option<i64> {
+        self.continuation_cutoff
     }
 
     pub fn tuner(&self) -> &GapTuner {
@@ -410,8 +469,7 @@ impl Machine {
             return false;
         }
 
-        // 开局之前不做战斗态校验 —— 那会儿本来就不在战斗里。
-        if !matches!(self.phase, Phase::Idle | Phase::WaitingBattle) {
+        if self.phase != Phase::Idle {
             if !view.in_battle {
                 self.fail(AbortReason::LeftBattle {
                     state: view.battle_state.clone(),
@@ -476,67 +534,10 @@ impl Machine {
         }
 
         match self.phase {
-            Phase::WaitingBattle => self.observe_waiting(view),
-            Phase::ConfirmingZero => self.observe_confirming(view),
             Phase::Cruising | Phase::Stepping => self.observe_running(view),
             _ => {}
         }
         true
-    }
-
-    fn observe_waiting(&mut self, view: &FrameView) {
-        if view.in_battle {
-            if !view.one_x {
-                self.fail(AbortReason::NotOneX {
-                    state: view.battle_state.clone(),
-                });
-                return;
-            }
-            self.cursor = view.elapsed;
-        }
-    }
-
-    fn observe_confirming(&mut self, view: &FrameView) {
-        self.cursor = view.elapsed;
-        if view.paused == Some(true) {
-            self.pause_probe = None;
-            self.paused = true;
-            self.origin = view.elapsed;
-
-            let first = self.copilot.actions[0].frame;
-            if self.origin > first {
-                self.fail(AbortReason::MissedStart {
-                    origin: self.origin,
-                    first_action: first,
-                });
-                return;
-            }
-            if self.origin != 0 {
-                // 不强求正好是第 0 帧。真正的不变量是"停在一个已知的绝对帧，
-                // 且不晚于第一个动作"—— 尺子的计数本来就是从开局算起的。
-                log::warn!(
-                    "battle-start pause landed on frame {} instead of 0 (still fine)",
-                    self.origin
-                );
-            }
-            self.phase = Phase::BindingFormation;
-            return;
-        }
-
-        // 还在跑：看看暂停键是不是压根没生效。
-        match self.pause_probe {
-            None => self.pause_probe = Some((view.elapsed, 0)),
-            Some((from, count)) => {
-                if view.elapsed > from {
-                    let count = count + 1;
-                    if count >= PAUSE_PROBE_LIMIT {
-                        self.fail(AbortReason::OpeningPauseIneffective);
-                    } else {
-                        self.pause_probe = Some((view.elapsed, count));
-                    }
-                }
-            }
-        }
     }
 
     fn observe_running(&mut self, view: &FrameView) {
@@ -677,14 +678,6 @@ impl Machine {
             ),
             Phase::Finished => Command::Idle,
 
-            Phase::WaitingBattle => Command::ArmBattleStart,
-
-            Phase::ConfirmingZero => Command::AwaitFrame {
-                timeout: AWAIT_TIMEOUT,
-            },
-
-            Phase::BindingFormation => Command::BindFormation,
-
             Phase::Cruising | Phase::Stepping | Phase::Injecting => self.next_running_command(),
         }
     }
@@ -766,12 +759,6 @@ impl Machine {
     /// 回报一条命令已经执行完。
     pub fn completed(&mut self, completion: Completion) {
         match completion {
-            Completion::OpeningPauseDelegated => {
-                if self.phase == Phase::WaitingBattle {
-                    self.phase = Phase::ConfirmingZero;
-                    self.pause_probe = None;
-                }
-            }
             Completion::PauseSent => {
                 // 运行期 Pause 只表示按键已发送；必须等尺子确认后才能进入慢速等待。
                 self.paused = false;
@@ -796,11 +783,6 @@ impl Machine {
                 self.pulse_paused_samples = 0;
                 self.pulse_from = self.cursor;
             }
-            // 这两个都回到推进逻辑，由 next_running_command 决定下一步：
-            // 同帧还有动作就接着注入，帧号更大就巡航/推进，没动作了就收尾。
-            // 注意**不要**在这里直接置 Finished —— Runner 仍需收到无输入的 Finish
-            // 命令，以便记录完成状态并退出循环。
-            Completion::FormationBound => self.phase = Phase::Stepping,
             Completion::ActionExecuted => {
                 // 只有真正会向游戏发输入的动作才可能触发选中/拖拽慢放。
                 // Output 不改变游戏状态，不应打开 0.2x 宽限窗口。
@@ -868,18 +850,10 @@ mod tests {
         }
     }
 
-    /// 走完"等开局 → AFA 自动暂停 → 编队"，返回一台停在第 0 帧、绑定已完成的状态机。
+    /// 用第 0 帧的暂停接管样本构造一台可直接推进的状态机。
     fn machine_at_zero() -> Machine {
         let mut m = machine();
-        m.start();
-        assert_eq!(m.next_command(), Command::ArmBattleStart);
-        m.observe(&view(1, 0, false));
-        m.completed(Completion::OpeningPauseDelegated);
-        assert_eq!(m.phase(), Phase::ConfirmingZero);
-        m.observe(&view(2, 0, true));
-        assert_eq!(m.phase(), Phase::BindingFormation);
-        assert_eq!(m.next_command(), Command::BindFormation);
-        m.completed(Completion::FormationBound);
+        assert!(m.take_over(&view(2, 0, true)));
         m
     }
 
@@ -901,28 +875,13 @@ mod tests {
     #[test]
     fn happy_path_reaches_frame_zero_and_injects_immediately() {
         let mut m = machine_at_zero();
-        assert_eq!(m.origin(), 0);
+        assert_eq!(m.takeover_frame(), 0);
         assert_eq!(m.cursor(), 0);
         // 第一个动作就在第 0 帧，应当立刻注入
         assert_eq!(m.next_command(), Command::Execute { index: 0 });
         m.completed(Completion::ActionExecuted);
         assert_eq!(m.progress(), (1, 3));
         assert_eq!(m.target(), Some(60));
-    }
-
-    #[test]
-    fn opening_pause_is_delegated_to_afa_without_a_pause_command() {
-        let mut m = machine();
-        m.start();
-        assert_eq!(m.next_command(), Command::ArmBattleStart);
-
-        m.observe(&view(1, 0, false));
-        m.completed(Completion::OpeningPauseDelegated);
-        assert_eq!(m.phase(), Phase::ConfirmingZero);
-        assert!(matches!(m.next_command(), Command::AwaitFrame { .. }));
-
-        m.observe(&view(2, 0, true));
-        assert_eq!(m.phase(), Phase::BindingFormation);
     }
 
     #[test]
@@ -1276,17 +1235,49 @@ mod tests {
     fn missing_the_start_aborts_with_a_clear_message() {
         let job = JOB.replace(r#""frame":0"#, r#""frame":5"#);
         let mut m = Machine::new(Copilot::parse(&job).unwrap());
-        m.start();
-        m.observe(&view(1, 0, false));
-        m.completed(Completion::OpeningPauseDelegated);
         // 实际停在第 9 帧，已经晚于第一个动作（第 5 帧）
-        m.observe(&view(2, 9, true));
+        assert!(!m.take_over(&view(2, 9, true)));
         assert_eq!(m.phase(), Phase::Aborted);
         assert!(matches!(
             m.abort_reason(),
             Some(AbortReason::MissedStart {
-                origin: 9,
+                takeover_frame: 9,
                 first_action: 5
+            })
+        ));
+    }
+
+    #[test]
+    fn continuation_starts_at_first_action_after_frozen_cutoff() {
+        let job = Copilot::parse(include_str!("../../../examples/test1.json")).unwrap();
+        let plan = ContinuationPlan::build(&job, 11).unwrap();
+        let mut machine = Machine::with_continuation(job, &plan, 20);
+
+        assert!(machine.take_over(&view(2, 12, true)));
+        assert_eq!(machine.progress(), (1, 6));
+        assert_eq!(machine.target(), Some(40));
+        assert_eq!(machine.continuation_cutoff(), Some(11));
+    }
+
+    #[test]
+    fn continuation_rejects_takeover_before_cutoff_or_after_next_action() {
+        let job = Copilot::parse(include_str!("../../../examples/test1.json")).unwrap();
+        let plan = ContinuationPlan::build(&job, 11).unwrap();
+
+        let mut backwards = Machine::with_continuation(job.clone(), &plan, 20);
+        assert!(!backwards.take_over(&view(2, 10, true)));
+        assert!(matches!(
+            backwards.abort_reason(),
+            Some(AbortReason::FrameWentBackwards { from: 11, to: 10 })
+        ));
+
+        let mut missed = Machine::with_continuation(job, &plan, 20);
+        assert!(!missed.take_over(&view(2, 41, true)));
+        assert!(matches!(
+            missed.abort_reason(),
+            Some(AbortReason::MissedStart {
+                takeover_frame: 41,
+                first_action: 40
             })
         ));
     }
@@ -1296,54 +1287,9 @@ mod tests {
         // 停在第 3 帧、第一个动作在第 5 帧 => 可以接受，正常往下走
         let job = JOB.replace(r#""frame":0"#, r#""frame":5"#);
         let mut m = Machine::new(Copilot::parse(&job).unwrap());
-        m.start();
-        m.observe(&view(1, 0, false));
-        m.completed(Completion::OpeningPauseDelegated);
-        m.observe(&view(2, 3, true));
-        assert_eq!(m.phase(), Phase::BindingFormation);
-        assert_eq!(m.origin(), 3);
+        assert!(m.take_over(&view(2, 3, true)));
+        assert_eq!(m.takeover_frame(), 3);
         assert_eq!(m.cursor(), 3);
-    }
-
-    #[test]
-    fn afa_opening_pause_that_never_takes_effect_aborts() {
-        let mut m = machine();
-        m.start();
-        m.observe(&view(1, 0, false));
-        m.completed(Completion::OpeningPauseDelegated);
-        // AFA 没有自动暂停，帧数一直在涨。
-        // 要涨满 PAUSE_PROBE_LIMIT 条才判定 —— 前几条是按键与分析的固有延迟，
-        // 帧数理应还在增长，不能急着判死刑。
-        for i in 0..PAUSE_PROBE_LIMIT + 1 {
-            let elapsed = i64::from(3 * (i + 1));
-            m.observe(&view(10 + u64::from(i), elapsed, false));
-        }
-        assert_eq!(m.phase(), Phase::Aborted);
-        assert!(matches!(
-            m.abort_reason(),
-            Some(AbortReason::OpeningPauseIneffective)
-        ));
-    }
-
-    #[test]
-    fn short_growth_before_afa_opening_pause_is_tolerated() {
-        // AFA 自动暂停生效前头几条样本帧数仍在增长是正常的；
-        // 只要在 PAUSE_PROBE_LIMIT 之内出现了暂停态样本，就应当正常进入编队阶段。
-        // 首个动作放在第 10 帧 —— 停在第 5 帧不算错过开局。
-        let job = JOB.replace(r#""frame":0"#, r#""frame":10"#);
-        let mut m = Machine::new(Copilot::parse(&job).unwrap());
-        m.start();
-        m.observe(&view(1, 0, false));
-        m.completed(Completion::OpeningPauseDelegated);
-        // 4 条仍在增长的样本（少于上限）
-        for i in 0..4_u64 {
-            m.observe(&view(10 + i, 1 + i as i64, false));
-        }
-        assert_eq!(m.phase(), Phase::ConfirmingZero, "尚未到上限，不该中止");
-        // 暂停终于生效，停在第 5 帧
-        m.observe(&view(20, 5, true));
-        assert_eq!(m.phase(), Phase::BindingFormation);
-        assert_eq!(m.origin(), 5);
     }
 
     #[test]
@@ -1462,11 +1408,7 @@ mod tests {
             ]
         }"#;
         let mut m = Machine::new(Copilot::parse(job).unwrap());
-        m.start();
-        m.observe(&view(1, 0, false));
-        m.completed(Completion::OpeningPauseDelegated);
-        m.observe(&view(2, 0, true));
-        m.completed(Completion::FormationBound);
+        assert!(m.take_over(&view(2, 0, true)));
 
         assert_eq!(m.next_command(), Command::Execute { index: 0 });
         m.completed(Completion::ActionExecuted);
@@ -1487,11 +1429,7 @@ mod tests {
             ]
         }"#;
         let mut m = Machine::new(Copilot::parse(job).unwrap());
-        m.start();
-        m.observe(&view(1, 0, false));
-        m.completed(Completion::OpeningPauseDelegated);
-        m.observe(&view(2, 0, true));
-        m.completed(Completion::FormationBound);
+        assert!(m.take_over(&view(2, 0, true)));
 
         assert_eq!(m.next_command(), Command::Execute { index: 0 });
         m.completed(Completion::ActionExecuted);

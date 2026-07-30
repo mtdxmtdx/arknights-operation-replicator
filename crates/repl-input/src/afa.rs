@@ -136,6 +136,10 @@ impl AfaController {
                 bindings.pause_retreat,
                 settings_path.display(),
             );
+            log::info!(
+                "AFA 预检通过：process={AFA_PROCESS} pid={process_id} elevated=true settings={}",
+                settings_path.display(),
+            );
         }
         Ok(Self {
             settings_path,

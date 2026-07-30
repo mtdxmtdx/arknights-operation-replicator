@@ -11,7 +11,7 @@ export struct ActionRow {
     target: string,
     location: string,
     doc: string,
-    /// 0 待执行 / 1 对帧中 / 2 已注入 / 3 失败
+    /// 0 待执行 / 1 对帧中 / 2 尺子确认完成 / 3 失败 / 4 用户确认完成
     status: int,
 }
 
@@ -23,6 +23,34 @@ export struct CardRow {
     cooling: bool,
     /// 已经绑定到哪个干员；空串表示还没绑。
     bound-to: string,
+}
+
+/// 编辑器时间轴中的动作。id 只在本次编辑会话内有效。
+export struct EditorActionRow {
+    id: int,
+    frame: int,
+    kind: string,
+    lane: string,
+    target: string,
+    location: string,
+    direction: string,
+    doc: string,
+    selected: bool,
+    /// 0 正常 / 1 警告 / 2 错误
+    severity: int,
+}
+
+export struct DiagnosticRow {
+    severity: int,
+    message: string,
+}
+
+export struct MapCell {
+    x: int,
+    y: int,
+    /// 0 不可部署 / 1 地面 / 2 高台 / 3 通用
+    buildable: int,
+    selected: bool,
 }
 
 component StatusLight inherits HorizontalLayout {
@@ -61,6 +89,7 @@ component TimelineRow inherits Rectangle {
             background: root.entry.status == 1 ? Theme.accent
                       : root.entry.status == 2 ? Theme.ok
                       : root.entry.status == 3 ? Theme.error
+                      : root.entry.status == 4 ? Theme.ok
                       : Theme.idle;
         }
         Text {
@@ -99,6 +128,80 @@ component TimelineRow inherits Rectangle {
             vertical-alignment: center;
             overflow: elide;
         }
+        Text {
+            width: 76px;
+            text: root.entry.status == 4 ? "用户确认"
+                : root.entry.status == 2 ? "已确认"
+                : root.entry.status == 3 ? "失败"
+                : "";
+            color: root.entry.status == 3 ? Theme.error
+                : root.entry.status >= 2 ? Theme.ok
+                : Theme.text-dim;
+            font-size: 11px;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component EditorTimelineRow inherits Rectangle {
+    in property <EditorActionRow> entry;
+    in property <int> view-start;
+    callback selected(int);
+    height: 42px;
+    background: entry.selected ? #343b46 : transparent;
+    border-width: entry.selected ? 1px : 0px;
+    border-color: Theme.accent;
+
+    TouchArea { clicked => { root.selected(root.entry.id); } }
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 8px;
+        Rectangle {
+            width: 116px;
+            background: Theme.panel-alt;
+            border-radius: 3px;
+            Text {
+                text: root.entry.lane;
+                color: root.entry.lane == "输出 / 注释" ? Theme.text-dim : Theme.text;
+                font-size: 12px;
+                font-weight: 600;
+                vertical-alignment: center;
+                horizontal-alignment: center;
+                overflow: elide;
+            }
+        }
+        Rectangle {
+            clip: true;
+            border-width: 0px;
+            border-color: Theme.line;
+            Rectangle {
+                x: max(0px, min(parent.width - 150px, (root.entry.frame - root.view-start) * 3px));
+                y: 5px;
+                width: 150px;
+                height: 32px;
+                border-radius: 3px;
+                background: root.entry.severity == 2 ? #5a292d
+                          : root.entry.severity == 1 ? #554421
+                          : root.entry.kind == "部署" ? #234b4d
+                          : root.entry.kind == "技能" ? #43375b
+                          : root.entry.kind == "撤退" ? #543238
+                          : #303640;
+                border-width: 1px;
+                border-color: root.entry.selected ? Theme.accent
+                            : root.entry.severity == 2 ? Theme.error
+                            : root.entry.severity == 1 ? Theme.warn
+                            : Theme.line;
+                HorizontalLayout {
+                    padding-left: 7px;
+                    padding-right: 7px;
+                    spacing: 6px;
+                    Text { text: "F" + root.entry.frame; color: Theme.accent; font-size: 11px; font-weight: 700; vertical-alignment: center; }
+                    Text { text: root.entry.kind; color: Theme.text; font-size: 11px; vertical-alignment: center; }
+                    Text { text: root.entry.target; color: Theme.text-dim; font-size: 11px; vertical-alignment: center; overflow: elide; }
+                }
+            }
+        }
     }
 }
 
@@ -125,7 +228,45 @@ export component MainWindow inherits Window {
     in property <string> log-text: "";
     in property <bool> running;
     in property <bool> can-start;
+    in property <bool> can-continue;
     in property <[ActionRow]> actions;
+
+    // 风险确认式继续。详情由当前冻结快照和作业共同生成。
+    in property <bool> continue-visible;
+    in property <bool> continue-confirm-enabled;
+    in property <string> continue-cutoff-text;
+    in property <string> continue-skipped-text;
+    in property <string> continue-battlefield-text;
+    in property <string> continue-next-text;
+    in property <string> continue-archive-text;
+
+    // 作业编辑器。编辑模式与复刻模式互斥；编辑模式不会探测或调用 AFA。
+    in-out property <bool> editor-mode: true;
+    in property <string> editor-title: "未命名作业";
+    in property <string> editor-stage: "";
+    in property <string> editor-path: "尚未保存";
+    in property <bool> editor-dirty;
+    in property <bool> editor-can-undo;
+    in property <bool> editor-can-redo;
+    in property <bool> editor-can-run;
+    in property <bool> editor-follow-ruler;
+    in property <int> editor-cursor-frame;
+    in property <int> editor-view-start;
+    in property <[EditorActionRow]> editor-actions;
+    in property <[DiagnosticRow]> editor-diagnostics;
+    in property <[string]> editor-operators;
+    in property <[MapCell]> editor-map-cells;
+    in property <int> editor-map-width;
+    in property <int> editor-map-height;
+    in property <string> editor-map-status: "输入关卡标识以载入逻辑地图";
+    in property <int> editor-selected-id: -1;
+    in property <string> editor-selected-kind: "";
+    in property <string> editor-selected-frame: "";
+    in property <string> editor-selected-name: "";
+    in property <string> editor-selected-x: "";
+    in property <string> editor-selected-y: "";
+    in property <string> editor-selected-direction: "Right";
+    in property <string> editor-selected-doc: "";
 
     // 编队绑定面板
     in property <bool> binding-visible;
@@ -138,13 +279,333 @@ export component MainWindow inherits Window {
     // ——— 回调 ———
     callback load-job();
     callback start-run();
+    callback request-continue();
+    callback confirm-continue();
+    callback cancel-continue();
     callback stop-run();
     callback bind-card(int, string);
     callback binding-confirm();
     callback accept-disclaimer();
     callback open-settings();
+    callback switch-mode(bool);
+    callback editor-new();
+    callback editor-open();
+    callback editor-save(bool);
+    callback editor-undo();
+    callback editor-redo();
+    callback editor-add-action(string);
+    callback editor-select(int);
+    callback editor-delete();
+    callback editor-duplicate();
+    callback editor-move-order(int);
+    callback editor-set-follow(bool);
+    callback editor-set-cursor(string);
+    callback editor-set-metadata(string, string);
+    callback editor-set-action(string, string);
+    callback editor-set-location(string, string);
+    callback editor-select-map-cell(int, int);
+    callback editor-add-operator(string);
+    callback editor-rename-operator(string, string);
+    callback editor-remove-operator(string);
 
     VerticalLayout {
+        Rectangle {
+            height: 44px;
+            background: #101216;
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 10px;
+                spacing: 6px;
+                Text {
+                    width: 190px;
+                    text: "OPERATION // REPLICATOR";
+                    color: Theme.text;
+                    font-size: 12px;
+                    font-weight: 800;
+                    vertical-alignment: center;
+                }
+                Button {
+                    text: "作业编辑";
+                    primary: root.editor-mode;
+                    enabled: !root.running;
+                    clicked => { root.switch-mode(true); }
+                }
+                Button {
+                    text: "复刻执行";
+                    primary: !root.editor-mode;
+                    enabled: !root.running;
+                    clicked => { root.switch-mode(false); }
+                }
+                Rectangle { }
+                Text {
+                    text: root.editor-mode ? "ZERO INPUT / MANUAL TIMING" : "LIVE AUTOMATION";
+                    color: root.editor-mode ? Theme.ok : Theme.warn;
+                    font-size: 10px;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                }
+            }
+        }
+        Rectangle { height: 1px; background: Theme.line; }
+
+        if root.editor-mode: VerticalLayout {
+            Rectangle {
+                height: 48px;
+                background: Theme.panel;
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    spacing: 6px;
+                    Button { text: "新建"; clicked => { root.editor-new(); } }
+                    Button { text: "打开"; clicked => { root.editor-open(); } }
+                    Button { text: "保存"; primary: root.editor-dirty; clicked => { root.editor-save(false); } }
+                    Button { text: "另存为"; clicked => { root.editor-save(true); } }
+                    Rectangle { width: 1px; background: Theme.line; }
+                    Button { text: "撤销"; enabled: root.editor-can-undo; clicked => { root.editor-undo(); } }
+                    Button { text: "重做"; enabled: root.editor-can-redo; clicked => { root.editor-redo(); } }
+                    Rectangle { }
+                    Text {
+                        text: root.editor-dirty ? "● 未保存" : "✓ 已保存";
+                        color: root.editor-dirty ? Theme.warn : Theme.ok;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+            Rectangle { height: 1px; background: Theme.line; }
+            HorizontalLayout {
+                spacing: 0px;
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    Rectangle {
+                        height: 66px;
+                        background: #181b20;
+                        HorizontalLayout {
+                            padding: 8px;
+                            spacing: 8px;
+                            VerticalLayout {
+                                width: 210px;
+                                spacing: 3px;
+                                Text { text: "作业标题"; color: Theme.text-dim; font-size: 10px; }
+                                LineEdit { text: root.editor-title; edited => { root.editor-set-metadata("title", self.text); } }
+                            }
+                            VerticalLayout {
+                                width: 180px;
+                                spacing: 3px;
+                                Text { text: "关卡标识"; color: Theme.text-dim; font-size: 10px; }
+                                LineEdit { text: root.editor-stage; placeholder-text: "例如 main_01-07"; edited => { root.editor-set-metadata("stage", self.text); } }
+                            }
+                            VerticalLayout {
+                                spacing: 3px;
+                                Text { text: "文件"; color: Theme.text-dim; font-size: 10px; }
+                                Text { text: root.editor-path; color: Theme.text; font-size: 11px; vertical-alignment: center; overflow: elide; }
+                            }
+                        }
+                    }
+                    Rectangle {
+                        height: 52px;
+                        background: Theme.panel;
+                        HorizontalLayout {
+                            padding: 8px;
+                            spacing: 6px;
+                            Text { text: "ADD"; color: Theme.text-dim; font-size: 10px; font-weight: 700; vertical-alignment: center; }
+                            Button { text: "+ 部署"; clicked => { root.editor-add-action("Deploy"); } }
+                            Button { text: "+ 技能"; clicked => { root.editor-add-action("Skill"); } }
+                            Button { text: "+ 撤退"; clicked => { root.editor-add-action("Retreat"); } }
+                            Button { text: "+ 注释"; clicked => { root.editor-add-action("Output"); } }
+                            Rectangle { }
+                            Text { text: "光标帧"; color: Theme.text-dim; font-size: 11px; vertical-alignment: center; }
+                            LineEdit {
+                                width: 72px;
+                                text: "" + root.editor-cursor-frame;
+                                input-type: number;
+                                edited => { root.editor-set-cursor(self.text); }
+                            }
+                            Button {
+                                text: root.editor-follow-ruler ? "跟随尺子：开" : "跟随尺子：关";
+                                primary: root.editor-follow-ruler;
+                                clicked => { root.editor-set-follow(!root.editor-follow-ruler); }
+                            }
+                        }
+                    }
+                    Rectangle {
+                        height: 30px;
+                        background: #121419;
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            spacing: 8px;
+                            Text { width: 116px; text: "轨道 / 干员"; color: Theme.text-dim; font-size: 10px; vertical-alignment: center; }
+                            Text { text: "F" + root.editor-view-start + "       时间轴（每帧 3px）"; color: Theme.text-dim; font-size: 10px; vertical-alignment: center; }
+                        }
+                    }
+                    ScrollView {
+                        vertical-stretch: 1;
+                        VerticalLayout {
+                            alignment: start;
+                            for entry in root.editor-actions: EditorTimelineRow {
+                                entry: entry;
+                                view-start: root.editor-view-start;
+                                selected(id) => { root.editor-select(id); }
+                            }
+                            if root.editor-actions.length == 0: Rectangle {
+                                height: 140px;
+                                Text {
+                                    text: "时间轴为空\n把光标放到目标帧，再添加一个动作";
+                                    color: Theme.text-dim;
+                                    font-size: 12px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+                    Rectangle {
+                        height: 86px;
+                        background: Theme.panel;
+                        VerticalLayout {
+                            padding: 7px;
+                            spacing: 3px;
+                            Text { text: "DIAGNOSTICS"; color: Theme.text-dim; font-size: 10px; font-weight: 700; }
+                            ScrollView {
+                                VerticalLayout {
+                                    alignment: start;
+                                    for diagnostic in root.editor-diagnostics: Text {
+                                        text: (diagnostic.severity == 2 ? "错误  " : "警告  ") + diagnostic.message;
+                                        color: diagnostic.severity == 2 ? Theme.error : Theme.warn;
+                                        font-size: 10px;
+                                    }
+                                    if root.editor-diagnostics.length == 0: Text { text: "✓ 当前作业可以编译运行"; color: Theme.ok; font-size: 10px; }
+                                }
+                            }
+                        }
+                    }
+                }
+                Rectangle { width: 1px; background: Theme.line; }
+                Rectangle {
+                    width: 262px;
+                    background: #181b20;
+                    VerticalLayout {
+                        padding: 10px;
+                        spacing: 7px;
+                        Text { text: "ACTION INSPECTOR"; color: Theme.text; font-size: 11px; font-weight: 800; }
+                        Text { text: "编队干员"; color: Theme.text-dim; font-size: 10px; }
+                        HorizontalLayout {
+                            spacing: 5px;
+                            new-oper := LineEdit { placeholder-text: "添加干员"; }
+                            Button { text: "+"; clicked => { root.editor-add-operator(new-oper.text); new-oper.text = ""; } }
+                        }
+                        Rectangle {
+                            height: min(62px, root.editor-operators.length * 24px + 4px);
+                            background: #101317;
+                            ScrollView {
+                                VerticalLayout {
+                                    alignment: start;
+                                    for oper in root.editor-operators: HorizontalLayout {
+                                        height: 24px;
+                                        LineEdit {
+                                            text: oper;
+                                            accepted => { root.editor-rename-operator(oper, self.text); }
+                                        }
+                                        Button { text: "×"; clicked => { root.editor-remove-operator(oper); } }
+                                    }
+                                }
+                            }
+                        }
+                        if root.editor-selected-id < 0: Text {
+                            text: "在时间轴中选择一个动作";
+                            color: Theme.text-dim;
+                            font-size: 11px;
+                        }
+                        if root.editor-selected-id >= 0: VerticalLayout {
+                            spacing: 7px;
+                            Text { text: "类型  " + root.editor-selected-kind; color: Theme.accent; font-size: 12px; font-weight: 700; }
+                            Text { text: "绝对帧"; color: Theme.text-dim; font-size: 10px; }
+                            LineEdit { text: root.editor-selected-frame; input-type: number; edited => { root.editor-set-action("frame", self.text); } }
+                            Text { text: "目标干员 / 轨道"; color: Theme.text-dim; font-size: 10px; }
+                            LineEdit { text: root.editor-selected-name; placeholder-text: "干员名"; edited => { root.editor-set-action("name", self.text); } }
+                            if root.editor-selected-kind == "部署": VerticalLayout {
+                                spacing: 6px;
+                                Text { text: "部署格（逻辑坐标）"; color: Theme.text-dim; font-size: 10px; }
+                                HorizontalLayout {
+                                    spacing: 5px;
+                                    x-edit := LineEdit {
+                                        text: root.editor-selected-x;
+                                        placeholder-text: "X";
+                                        input-type: number;
+                                        edited => { root.editor-set-location(self.text, y-edit.text); }
+                                    }
+                                    y-edit := LineEdit {
+                                        text: root.editor-selected-y;
+                                        placeholder-text: "Y";
+                                        input-type: number;
+                                        edited => { root.editor-set-location(x-edit.text, self.text); }
+                                    }
+                                }
+                                Text { text: "朝向（Right / Down / Left / Up / None）"; color: Theme.text-dim; font-size: 10px; }
+                                LineEdit { text: root.editor-selected-direction; edited => { root.editor-set-action("direction", self.text); } }
+                                Rectangle {
+                                    height: max(76px, min(154px, root.editor-map-height * 14px + 4px));
+                                    background: #101317;
+                                    border-width: 1px;
+                                    border-color: Theme.line;
+                                    clip: true;
+                                    for cell in root.editor-map-cells: Rectangle {
+                                        x: 2px + cell.x * 14px;
+                                        y: 2px + cell.y * 14px;
+                                        width: 12px;
+                                        height: 12px;
+                                        background: cell.selected ? Theme.accent
+                                                  : cell.buildable == 1 ? #365f4b
+                                                  : cell.buildable == 2 ? #465574
+                                                  : cell.buildable == 3 ? #58613a
+                                                  : #242932;
+                                        border-width: cell.selected ? 1px : 0px;
+                                        border-color: #ffffff;
+                                        TouchArea { clicked => { root.editor-select-map-cell(cell.x, cell.y); } }
+                                    }
+                                    if root.editor-map-cells.length == 0: Text {
+                                        text: root.editor-map-status;
+                                        color: Theme.text-dim;
+                                        font-size: 9px;
+                                        wrap: word-wrap;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                            Text { text: "说明 / 输出内容"; color: Theme.text-dim; font-size: 10px; }
+                            LineEdit { text: root.editor-selected-doc; edited => { root.editor-set-action("doc", self.text); } }
+                            HorizontalLayout {
+                                spacing: 5px;
+                                Button { text: "同帧 ↑"; clicked => { root.editor-move-order(-1); } }
+                                Button { text: "同帧 ↓"; clicked => { root.editor-move-order(1); } }
+                            }
+                            HorizontalLayout {
+                                spacing: 5px;
+                                Button { text: "复制"; clicked => { root.editor-duplicate(); } }
+                                Button { text: "删除"; clicked => { root.editor-delete(); } }
+                            }
+                        }
+                        Rectangle { }
+                        Rectangle {
+                            height: 52px;
+                            background: root.editor-can-run ? #1f4230 : #3d2528;
+                            border-radius: 3px;
+                            Text {
+                                text: root.editor-can-run ? "READY // 可切到复刻执行" : "DRAFT // 有错误，禁止运行";
+                                color: root.editor-can-run ? Theme.ok : Theme.error;
+                                font-size: 11px;
+                                font-weight: 700;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !root.editor-mode: VerticalLayout {
         // ——— 顶部状态条 ———
         Rectangle {
             height: 76px;
@@ -269,6 +730,11 @@ export component MainWindow inherits Window {
                     clicked => { start-run(); }
                 }
                 Button {
+                    text: "继续";
+                    enabled: can-continue && !running;
+                    clicked => { request-continue(); }
+                }
+                Button {
                     text: "中止";
                     enabled: running;
                     clicked => { stop-run(); }
@@ -284,6 +750,60 @@ export component MainWindow inherits Window {
                 Button {
                     text: "设置";
                     clicked => { open-settings(); }
+                }
+            }
+        }
+        }
+    }
+
+    // ——— 风险确认式继续模态 ———
+    if continue-visible: Rectangle {
+        background: #000000d9;
+        Rectangle {
+            width: 580px;
+            height: 450px;
+            background: Theme.panel;
+            border-radius: Theme.radius;
+            border-width: 1px;
+            border-color: Theme.line;
+
+            VerticalLayout {
+                padding: 18px;
+                spacing: 10px;
+                Text {
+                    text: "承担风险并继续";
+                    color: Theme.warn;
+                    font-size: 17px;
+                    font-weight: 700;
+                }
+                Text { text: continue-cutoff-text; color: Theme.text; font-size: 13px; }
+                ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        alignment: start;
+                        spacing: 8px;
+                        Text { text: "将视为“用户确认完成”的动作：\n" + continue-skipped-text; color: Theme.text-dim; font-size: 12px; wrap: word-wrap; }
+                        Text { text: "按作业推导的当前场上状态：\n" + continue-battlefield-text; color: Theme.text-dim; font-size: 12px; wrap: word-wrap; }
+                        Text { text: "下一动作：" + continue-next-text; color: Theme.text; font-size: 12px; wrap: word-wrap; }
+                        Text { text: continue-archive-text; color: continue-confirm-enabled ? Theme.text-dim : Theme.error; font-size: 12px; wrap: word-wrap; }
+                        Text {
+                            text: "风险：程序不会验证截止帧之前的部署、技能或撤退是否真的完成；错误的场上推导可能导致后续点击错误。继续会创建全新会话，且本次结果不能计入精确复刻验收。";
+                            color: Theme.warn;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: Theme.gap;
+                    Button { text: "取消"; clicked => { cancel-continue(); } }
+                    Button {
+                        text: "承担风险并继续";
+                        primary: true;
+                        enabled: continue-confirm-enabled;
+                        clicked => { confirm-continue(); }
+                    }
                 }
             }
         }

@@ -17,18 +17,24 @@
 //! - `gesture` 部署拖拽手势（移植自 MAA 的 `BattleHelper::deploy_oper`）
 //! - `machine` 帧复刻状态机（吃尺子快照，吐注入指令）
 
+pub mod continuation;
 pub mod copilot;
 pub mod geom;
 pub mod gesture;
+pub mod job_document;
 pub mod level;
 pub mod machine;
 pub mod stepping;
 pub mod tile;
 pub mod viewport;
 
+pub use continuation::{ContinuationError, ContinuationPlan};
 pub use copilot::{Action, ActionType, AfterLastAction, Copilot, CopilotError};
 pub use geom::{Direction, Placement, Point, Rect, Role, REF_ASPECT, REF_HEIGHT, REF_WIDTH};
 pub use gesture::{deploy, DeployGesture, Swipe};
+pub use job_document::{
+    ActionDraft, ActionId, Diagnostic, DiagnosticSeverity, JobDocument, JobDocumentError,
+};
 pub use level::{Level, LevelError, LevelPack, TileKey};
 pub use machine::{AbortReason, Command, Completion, FrameView, Machine, Phase};
 pub use stepping::GapTuner;

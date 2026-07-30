@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 env_logger.workspace = true
 image.workspace = true
 log.workspace = true
@@ -15,6 +16,7 @@ repl-core.workspace = true
 repl-frames.workspace = true
 repl-input.workspace = true
 repl-vision.workspace = true
+raw-window-handle.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 slint.workspace = true
@@ -28,6 +30,7 @@ repl-frames = { workspace = true, features = ["test-util"] }
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
     "Win32_Globalization",
+    "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_UI_Controls_Dialogs",
 ] }
