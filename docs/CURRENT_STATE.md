@@ -68,7 +68,7 @@
 ## 版本与发布状态
 
 - 分支：`develop`；触控越界修复为本地提交 `d8ad54b`，MAA 编队识别及配套链路为本地提交
-  `2e5a3f0`。当前比 `origin/develop` 领先 2 个提交，按用户要求尚未推送。
+  `2e5a3f0`。包含状态与验收文档提交后，本地比 `origin/develop` 领先 4 个提交，按用户要求尚未推送。
 - M8 验收基线二进制：大小 `14,710,272` 字节，SHA-256
   `4D510B3146FA40C95437E3E2914E7E8E42A2C91C53CFA8A8E035EEFF267AF8BD`。
 - 当前战前 OCR/F0 桥接构建：`target\release\repl-app.exe`，大小 34,304,512 字节，SHA-256
