@@ -111,6 +111,11 @@ pub fn deploy(
             screen.1,
             DIRECTION_FIX_LIMIT,
         );
+        // MAA 的控制器允许方向滑动保留少量屏外坐标，但 Windows
+        // InjectTouchInput 会直接拒绝负坐标。保留 MAA 的整段平移后，
+        // 再把仍然越界的端点收进客户区；起点最多只偏离落点 100px，
+        // 同时避免把已经成功的部署误判为整段动作失败。
+        fit_to_client_bounds(&mut start, &mut end, screen.0, screen.1);
         interpolate(
             start,
             end,
@@ -178,6 +183,19 @@ fn fix_out_of_limit(p1: &mut Point, p2: &mut Point, width: i32, height: i32, max
     let shift = direct * distance;
     *p1 = *p1 + shift;
     *p2 = *p2 + shift;
+}
+
+/// 把 Windows 触控路径限制在客户区有效像素内。
+///
+/// 方向滑动是直线，两个端点都在矩形内即可保证所有插值点都不会越界。
+/// 这一步只处理 MAA 有上限的平移仍未消除的溢出，因此可能缩短滑动，
+/// 但不会改变滑动方向。
+fn fit_to_client_bounds(p1: &mut Point, p2: &mut Point, width: i32, height: i32) {
+    let max_x = width.saturating_sub(1).max(0);
+    let max_y = height.saturating_sub(1).max(0);
+    let fit = |point: Point| Point::new(point.x.clamp(0, max_x), point.y.clamp(0, max_y));
+    *p1 = fit(*p1);
+    *p2 = fit(*p2);
 }
 
 #[cfg(test)]
@@ -299,15 +317,18 @@ mod tests {
     }
 
     #[test]
-    fn out_of_limit_shifts_the_whole_swipe_not_just_the_end() {
+    fn out_of_limit_keeps_maa_start_shift_then_fits_windows_client() {
         // 在右边缘往右拖，终点会超出屏幕
         let tile = Point::new(1200, 360);
         let g = deploy(tile, tile, Direction::Right, (1280, 720), 1.0);
         let swipe = g.direction.unwrap();
-        // 整段被左移，所以起点不再等于格子位置，但方向和长度保持
+        // 先按 MAA 规则整段左移，再把 Win32 无法注入的屏外终点收回客户区。
         assert!(swipe.start().x < tile.x, "整段应当被平移回来");
-        let length = swipe.end().x - swipe.start().x;
-        assert_eq!(length, 400, "平移不该改变滑动长度");
+        assert!(swipe.end().x > swipe.start().x, "仍须保持向右方向");
+        assert!(swipe
+            .points
+            .iter()
+            .all(|point| { (0..1280).contains(&point.x) && (0..720).contains(&point.y) }));
     }
 
     #[test]
@@ -332,6 +353,49 @@ mod tests {
         fix_out_of_limit(&mut p1, &mut p2, 1280, 720, 100);
         assert_eq!(p1, Point::new(100, 100));
         assert_eq!(p2, Point::new(200, 200));
+    }
+
+    #[test]
+    fn upward_direction_swipe_stays_inside_windows_client() {
+        // 实机回归：2560×1440 下，1-7 (7, 2) 的 y=416，向上 800px。
+        // MAA 的 100px 平移仍会留下负坐标；Windows InjectTouchInput 会拒绝它。
+        let g = deploy(
+            Point::new(1838, 416),
+            Point::new(1838, 416),
+            Direction::Up,
+            (2560, 1440),
+            2.0,
+        );
+        let swipe = g.direction.expect("应当有朝向滑动");
+
+        assert_eq!(swipe.start(), Point::new(1838, 516));
+        assert_eq!(swipe.end(), Point::new(1838, 0));
+        assert!(swipe.end().y < swipe.start().y, "仍须保持向上方向");
+        assert!(swipe
+            .points
+            .iter()
+            .all(|point| { (0..2560).contains(&point.x) && (0..1440).contains(&point.y) }));
+    }
+
+    #[test]
+    fn all_direction_swipes_stay_inside_client() {
+        for (tile, direction) in [
+            (Point::new(10, 360), Direction::Left),
+            (Point::new(1270, 360), Direction::Right),
+            (Point::new(640, 10), Direction::Up),
+            (Point::new(640, 710), Direction::Down),
+        ] {
+            let swipe = deploy(tile, tile, direction, (1280, 720), 1.0)
+                .direction
+                .expect("应当有朝向滑动");
+            assert!(
+                swipe
+                    .points
+                    .iter()
+                    .all(|point| { (0..1280).contains(&point.x) && (0..720).contains(&point.y) }),
+                "{direction:?} 产生了越界触点"
+            );
+        }
     }
 
     #[test]
