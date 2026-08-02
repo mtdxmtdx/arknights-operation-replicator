@@ -13,10 +13,9 @@
 //! 一次性把所有旗标找出来、按横坐标排序，然后从旗标位置按固定偏移量切出各个子区域
 //! （点击区、职业图标、可用性、冷却条、头像）。
 //!
-//! 与 MAA 的差别只有一处：MAA 靠一个全干员头像库 + OCR 详情页来**命名**卡片，
-//! 我们不做这件事 —— 干员名由用户在第零帧一次性绑定，之后全程用当时截下的头像
-//! 做模板跟踪（这正是 MAA 的 `analyze_oper_with_cache` 快路径）。省掉了
-//! PaddleOCR + ONNXRuntime + 2000 多张头像，约 240MB。
+//! 与 MAA 的差别是：本模块不在战斗部署栏内跑详情页 OCR 来**命名**卡片。干员名来自既有档案、
+//! `formation` 模块的战前人工确认与 F0 头像桥接，或保守回退的人工绑定；得到真实部署栏头像后，
+//! 全程用模板跟踪（这正是 MAA 的 `analyze_oper_with_cache` 快路径）。
 
 use repl_capture::Frame;
 use repl_core::{
@@ -196,12 +195,13 @@ pub fn analyze(frame: &Frame, viewport: &Viewport, templates: &TemplateSet) -> V
             .moved(AVATAR_MOVE)
             .clamped(bounds.width, bounds.height);
 
-        let Some(role) = classify_role(frame, role_rect, templates) else {
-            // MAA 在这里也是直接跳过：认不出职业说明这根本不是一张卡片
-            // （多半是旗标误检），继续用它反而会点到奇怪的地方。
-            log::debug!("skipping card at {}: unknown role", flag.rect);
-            continue;
-        };
+        // MAA 会在职业识别失败时丢掉整张卡，因为它后续需要职业来命名干员。
+        // 本程序由用户手工绑定名字，职业只作提示，旗标已经足以证明这里是一张卡。
+        // PC 客户端的职业图标与安卓模板存在差异时，保留为“未知”比让绑定面板漏卡安全。
+        let role = classify_role(frame, role_rect, templates).unwrap_or_else(|| {
+            log::debug!("keeping flagged card at {} with unknown role", flag.rect);
+            Role::Unknown
+        });
         if avatar_rect.is_empty() || click_rect.is_empty() {
             continue;
         }
@@ -551,6 +551,67 @@ mod tests {
             pixels.extend_from_slice(&[bgr[0], bgr[1], bgr[2], 255]);
         }
         Frame::new(width, height, pixels)
+    }
+
+    fn draw_checker(frame: &mut Frame, rect: Rect, bgr: [u8; 3]) {
+        for y in rect.y..rect.bottom() {
+            for x in rect.x..rect.right() {
+                let i = (y as usize * frame.width as usize + x as usize) * 4;
+                let delta = if (x - rect.x + y - rect.y) % 2 == 0 {
+                    0
+                } else {
+                    40
+                };
+                frame.pixels[i] = bgr[0].saturating_sub(delta);
+                frame.pixels[i + 1] = bgr[1].saturating_sub(delta);
+                frame.pixels[i + 2] = bgr[2].saturating_sub(delta);
+            }
+        }
+    }
+
+    fn crop_template(frame: &Frame, rect: Rect, name: &str) -> Template {
+        Template::from_bgra(
+            name,
+            rect.width as u32,
+            rect.height as u32,
+            &crop_bgra(frame, rect),
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn binding_keeps_a_flagged_card_when_role_is_unrecognized() {
+        let viewport = Viewport::new(1280, 720, 0.0);
+        let mut frame = frame_of(1280, 720, [80, 80, 80]);
+        let band = flag_search_roi(&viewport);
+        let flag_rect = Rect::new(300, band.y + 8, 10, 11);
+        draw_checker(&mut frame, flag_rect, [220, 170, 40]);
+        let opers_flag = crop_template(&frame, flag_rect, "flag");
+
+        // Keep every role template structurally valid but absent from the role ROI. This
+        // reproduces the binding failure mode: the deployment flag is certain, while a
+        // profession icon changed or scores below the classifier threshold.
+        let mut role_source = frame_of(29, 24, [10, 10, 10]);
+        draw_checker(&mut role_source, Rect::new(0, 0, 29, 24), [20, 30, 230]);
+        let roles = Role::ALL
+            .into_iter()
+            .map(|role| {
+                (
+                    role,
+                    crop_template(&role_source, role_source.bounds(), role.zh()),
+                )
+            })
+            .collect();
+        let templates = TemplateSet {
+            officially_begin: crop_template(&role_source, role_source.bounds(), "hud"),
+            opers_flag,
+            roles,
+        };
+
+        let cards = analyze(&frame, &viewport, &templates);
+        assert_eq!(cards.len(), 1, "职业识别失败不应让绑定面板丢掉整张卡");
+        assert_eq!(cards[0].role, Role::Unknown);
     }
 
     #[test]

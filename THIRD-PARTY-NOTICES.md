@@ -43,6 +43,7 @@ AGPL-3.0 与 GPL-3.0 的合并依据是 GPLv3 第 13 条：GPLv3 明确允许把
 | `repl-core/src/machine.rs` | `src/MaaCore/Task/Miscellaneous/BattleProcessTask.cpp`（动作序列主循环的结构；每步等待条件由视觉条件改为绝对逻辑帧） |
 | `repl-core/src/geom.rs` | `src/MaaCore/Common/AsstTypes.h`（`Point` / `Rect` / `rectMove` 语义） |
 | `repl-vision/src/deployment.rs` | `src/MaaCore/Vision/Battle/BattlefieldMatcher.cpp` (`deployment_analyze` 及其子分析)、`src/MaaCore/Task/BattleHelper.cpp` (`analyze_oper_with_cache`) |
+| `repl-vision/src/formation.rs` | `src/MaaCore/Vision/Battle/BattleFormationAnalyzer.cpp`、`TemplDetOCRer.cpp`、`RegionOCRer.cpp`、`CombatRecordRecognitionTask.cpp`、`OcrPackNcnn.cpp`（姓名锚点、OCR 预处理/CTC 与战前头像桥接思路） |
 | `repl-vision/src/ncc.rs` | 等价于 OpenCV `TM_CCOEFF_NORMED`；算法本身是公共知识，但阈值/掩码参数取自 MAA |
 | 各处数值常量 | `resource/tasks/tasks.json`（`BattleOpersFlag`、`BattleOper*`、`BattleSwipeOper`、`BattleUseOper`、`BattlePause` 等条目） |
 
@@ -61,7 +62,8 @@ AGPL-3.0 与 GPL-3.0 的合并依据是 GPLv3 第 13 条：GPLv3 明确允许把
 当前版本的 `repl-app/src/session.rs` **不再移植**上游的
 `ActionPauseSelect` / `ActionPauseSkill` / `ActionPauseRetreat` 的选中与功能键
 时序。它只负责部署触控、把 Skill / Retreat 的目标定位到当前鼠标位置，并向
-用户已启动的外部 AFA 发送一次配置中的热键；AFA 的技能/撤退时序仍由 AFA 自己执行。
+用户已启动的外部 AFA 发送一次配置中的热键；AFA 的暂停、恢复、逐帧、技能和撤退时序仍由 AFA
+自己执行。
 `repl-input/src/afa.rs` 是本项目的只读 INI 适配与 `SendInput` 委托代码，不是对 AFA
 源代码的复制。复刻器不修改 AFA 配置，也不在 AFA 不可用时回退这段已移除的 Rust 时序。
 
@@ -89,7 +91,9 @@ MIT 许可证只在分发其代码或实质部分时才要求附带版权声明�
    —— 上游为 [yuanyan3060/Arknights-Tile-Pos](https://github.com/yuanyan3060/Arknights-Tile-Pos)，
    由 MAA 二次分发。
 2. `resource/template/` 下的少量 UI 图标模板
-   （`BattleOpersFlag.png`、`BattleOperRole*.png`、`BattleOfficiallyBegin.png`）
+   （`BattleOpersFlag.png`、`BattleOperRole*.png`、`BattleOfficiallyBegin.png`、
+   `BattleFormationOCRNameFlag.png`），以及 `resource/PaddleOCR/rec/`、`battle_data.json`、
+   `tasks/tasks.json` 中编队识别所需的模型、字典、干员目录和任务参数
    —— 派生自《明日方舟》客户端素材。
 
 不随仓库分发这两类文件有两个理由：一是避免对上游游戏素材的版权状态做出我们无权做的

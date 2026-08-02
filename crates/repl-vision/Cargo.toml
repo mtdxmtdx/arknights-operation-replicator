@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 image.workspace = true
 log.workspace = true
+ort.workspace = true
 repl-capture.workspace = true
 repl-core.workspace = true
 serde = { workspace = true }

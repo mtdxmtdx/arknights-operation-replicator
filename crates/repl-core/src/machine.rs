@@ -95,8 +95,8 @@ pub enum Command {
     Pause,
     /// 发恢复键。
     Resume,
-    /// 发一次逐帧脉冲。
-    Pulse { gap: Duration },
+    /// 委托 AFA 发一次 1 倍速逐帧动作。
+    Pulse,
     /// 执行第 `index` 个动作。
     Execute { index: usize },
     /// 等下一条尺子样本。
@@ -285,20 +285,9 @@ impl Machine {
         }
     }
 
-    /// 用指定的初始脉冲间隔构造（调参 / 测试用）。
-    pub fn with_gap(copilot: Copilot, initial_gap_ms: u32) -> Self {
-        let mut m = Self::new(copilot);
-        m.tuner = GapTuner::new(initial_gap_ms);
-        m
-    }
-
     /// 从用户确认过的动作前缀之后建立一台新状态机。
-    pub fn with_continuation(
-        copilot: Copilot,
-        plan: &ContinuationPlan,
-        initial_gap_ms: u32,
-    ) -> Self {
-        let mut machine = Self::with_gap(copilot, initial_gap_ms);
+    pub fn with_continuation(copilot: Copilot, plan: &ContinuationPlan) -> Self {
+        let mut machine = Self::new(copilot);
         machine.action_index = plan.next_action_index;
         machine.continuation_cutoff = Some(plan.cutoff_frame);
         machine
@@ -744,16 +733,9 @@ impl Machine {
         }
         // 已暂停且还没到点：发一次脉冲，然后等结果。
         self.phase = Phase::Stepping;
-        // 最后一步是唯一致命的一步：这里 +2 就直接越过目标、整场作废
-        // （更早的 +2 只是离目标更近，无害；remaining==2 时 +2 甚至正好落在目标上）。
-        // 实测推进量几乎不随 gap 变化，但脉冲的解暂停窗口 ∝ gap ——
-        // 所以最后一步固定用最短 gap，把暴露窗口压到最小，宁可多空转几次。
-        let gap = if remaining == 1 {
-            Duration::from_millis(u64::from(crate::stepping::MIN_GAP_MS))
-        } else {
-            self.tuner.gap()
-        };
-        Command::Pulse { gap }
+        // Machine 只发出抽象的单步请求；Runner 将它委托给 AFA `33ms`，
+        // 并在下一步之前等待尺子确认本次事务已经稳定回到暂停态。
+        Command::Pulse
     }
 
     /// 回报一条命令已经执行完。
@@ -908,7 +890,7 @@ mod tests {
         assert_eq!(m.phase(), Phase::Stepping);
 
         // 之后就是逐帧脉冲
-        assert!(matches!(m.next_command(), Command::Pulse { .. }));
+        assert_eq!(m.next_command(), Command::Pulse);
     }
 
     #[test]
@@ -935,9 +917,7 @@ mod tests {
     }
 
     #[test]
-    fn final_step_uses_the_minimum_gap() {
-        // 最后一步（remaining == 1）必须用最短 gap：那是唯一 +2 会致命的位置，
-        // 解暂停窗口越短越安全。之前的步子照常用整定器的 gap。
+    fn every_step_delegates_the_same_afa_action() {
         let mut m = machine_at_zero();
         m.completed(Completion::ActionExecuted); // 目标变成 60
         m.completed(Completion::ResumeSent);
@@ -945,26 +925,12 @@ mod tests {
         m.completed(Completion::PauseSent);
         confirm_runtime_pause(&mut m, 11, 58);
 
-        let Command::Pulse { gap } = m.next_command() else {
-            panic!("应当发脉冲");
-        };
-        assert_eq!(
-            gap.as_millis() as u32,
-            m.tuner().gap_ms(),
-            "remaining=2 时用整定器的 gap"
-        );
+        assert_eq!(m.next_command(), Command::Pulse);
         m.completed(Completion::PulseSent);
         let mut frame_id = 12;
         confirm_pulse_without_running(&mut m, &mut frame_id, 59); // remaining = 1
 
-        let Command::Pulse { gap } = m.next_command() else {
-            panic!("应当发脉冲");
-        };
-        assert_eq!(
-            gap.as_millis() as u32,
-            crate::stepping::MIN_GAP_MS,
-            "remaining=1 时必须用最短 gap"
-        );
+        assert_eq!(m.next_command(), Command::Pulse);
     }
 
     #[test]
@@ -981,7 +947,7 @@ mod tests {
         for elapsed in 56..=60 {
             let cmd = m.next_command();
             assert!(
-                matches!(cmd, Command::Pulse { .. }),
+                matches!(cmd, Command::Pulse),
                 "第 {elapsed} 帧前应当发脉冲，实际 {cmd:?}"
             );
             m.completed(Completion::PulseSent);
@@ -1001,7 +967,7 @@ mod tests {
         m.completed(Completion::PauseSent);
         confirm_runtime_pause(&mut m, 11, 55);
 
-        assert!(matches!(m.next_command(), Command::Pulse { .. }));
+        assert_eq!(m.next_command(), Command::Pulse);
         m.completed(Completion::PulseSent);
 
         // 脉冲顺序是 ESC → pauseBattle，尺子可能先看到前半段的运行态。
@@ -1014,7 +980,7 @@ mod tests {
 
         m.observe(&view(13, 56, true));
         assert_eq!(m.tuner().pulses, 1, "最终暂停态才结算一次脉冲");
-        assert!(matches!(m.next_command(), Command::Pulse { .. }));
+        assert_eq!(m.next_command(), Command::Pulse);
     }
 
     #[test]
@@ -1026,7 +992,7 @@ mod tests {
         m.completed(Completion::PauseSent);
         confirm_runtime_pause(&mut m, 11, 59);
 
-        assert!(matches!(m.next_command(), Command::Pulse { .. }));
+        assert_eq!(m.next_command(), Command::Pulse);
         m.completed(Completion::PulseSent);
 
         // 实机复现顺序：脉冲后先冒出一条旧 paused，随后才出现真实 running。
@@ -1058,7 +1024,7 @@ mod tests {
             "发送 Pause 不等于游戏已经暂停，不能直接进入 1 秒等待和脉冲"
         );
         m.observe(&view(11, 55, true));
-        assert!(matches!(m.next_command(), Command::Pulse { .. }));
+        assert_eq!(m.next_command(), Command::Pulse);
     }
 
     #[test]
@@ -1111,7 +1077,7 @@ mod tests {
         m.observe(&view(10, 55, false));
         m.completed(Completion::PauseSent);
         confirm_runtime_pause(&mut m, 11, 55);
-        assert!(matches!(m.next_command(), Command::Pulse { .. }));
+        assert_eq!(m.next_command(), Command::Pulse);
         m.completed(Completion::PulseSent);
 
         for i in 0..PULSE_SETTLE_SAMPLE_LIMIT {
@@ -1139,7 +1105,7 @@ mod tests {
         let gap_before = m.tuner().gap_ms();
         let mut frame_id = 12;
         for _ in 0..3 {
-            assert!(matches!(m.next_command(), Command::Pulse { .. }));
+            assert_eq!(m.next_command(), Command::Pulse);
             m.completed(Completion::PulseSent);
             confirm_pulse_without_running(&mut m, &mut frame_id, 58);
         }
@@ -1150,7 +1116,7 @@ mod tests {
 
         // 继续空转到第 5 次才小幅加大 —— 那才说明间隔可能真的偏小
         for _ in 0..2 {
-            assert!(matches!(m.next_command(), Command::Pulse { .. }));
+            assert_eq!(m.next_command(), Command::Pulse);
             m.completed(Completion::PulseSent);
             confirm_pulse_without_running(&mut m, &mut frame_id, 58);
         }
@@ -1168,7 +1134,7 @@ mod tests {
         m.observe(&view(10, 59, false));
         m.completed(Completion::PauseSent);
         confirm_runtime_pause(&mut m, 11, 59);
-        assert!(matches!(m.next_command(), Command::Pulse { .. }));
+        assert_eq!(m.next_command(), Command::Pulse);
         m.completed(Completion::PulseSent);
 
         // 一发脉冲跨了两帧，直接越过 60
@@ -1193,7 +1159,7 @@ mod tests {
         m.observe(&view(10, 55, false));
         m.completed(Completion::PauseSent);
         confirm_runtime_pause(&mut m, 11, 55);
-        assert!(matches!(m.next_command(), Command::Pulse { .. }));
+        assert_eq!(m.next_command(), Command::Pulse);
         m.completed(Completion::PulseSent);
 
         // 光标遮挡：elapsed 停在旧值且不可信。若被当成"没推进"，
@@ -1251,7 +1217,7 @@ mod tests {
     fn continuation_starts_at_first_action_after_frozen_cutoff() {
         let job = Copilot::parse(include_str!("../../../examples/test1.json")).unwrap();
         let plan = ContinuationPlan::build(&job, 11).unwrap();
-        let mut machine = Machine::with_continuation(job, &plan, 20);
+        let mut machine = Machine::with_continuation(job, &plan);
 
         assert!(machine.take_over(&view(2, 12, true)));
         assert_eq!(machine.progress(), (1, 6));
@@ -1264,14 +1230,14 @@ mod tests {
         let job = Copilot::parse(include_str!("../../../examples/test1.json")).unwrap();
         let plan = ContinuationPlan::build(&job, 11).unwrap();
 
-        let mut backwards = Machine::with_continuation(job.clone(), &plan, 20);
+        let mut backwards = Machine::with_continuation(job.clone(), &plan);
         assert!(!backwards.take_over(&view(2, 10, true)));
         assert!(matches!(
             backwards.abort_reason(),
             Some(AbortReason::FrameWentBackwards { from: 11, to: 10 })
         ));
 
-        let mut missed = Machine::with_continuation(job, &plan, 20);
+        let mut missed = Machine::with_continuation(job, &plan);
         assert!(!missed.take_over(&view(2, 41, true)));
         assert!(matches!(
             missed.abort_reason(),

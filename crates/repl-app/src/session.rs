@@ -3,8 +3,7 @@
 //
 // 部署手势移植自 MaaAssistantArknights (AGPL-3.0-only) 的
 //   src/MaaCore/Task/BattleHelper.cpp (deploy_oper)
-// 逐帧脉冲和计时原语移植自 arknights-frame-assistant (GPL-3.0-only) 的
-//   src/lib/hotkey_actions.ahk；技能/撤退选中时序不在本项目复制，而由外部 AFA 委托执行。
+// 逐帧、暂停/恢复和技能/撤退时序不在本会话复制，而由外部 AFA 委托执行。
 // 详见仓库根目录 THIRD-PARTY-NOTICES.md。
 
 //! 一次复刻会话：把状态机的抽象指令翻译成真实的触控和按键。
@@ -18,9 +17,7 @@ use repl_core::{
     copilot::{Action, ActionType},
     gesture, Direction, Level, LevelPack, Point, TileProjection, Viewport,
 };
-use repl_input::{
-    mouse, precise_sleep, AfaAction, AfaController, GameKeys, PauseController, TouchInjector,
-};
+use repl_input::{mouse, precise_sleep, AfaAction, AfaController, GameKeys, TouchInjector};
 use repl_vision::{Card, Template, TemplateSet};
 
 use crate::config::{Binding, Config};
@@ -35,8 +32,6 @@ pub struct Session {
     pub projection: TileProjection,
     pub templates: TemplateSet,
     touch: TouchInjector,
-    /// 逐帧脉冲仍由 Rust 直接控制；普通暂停/恢复和技能/撤退走 AFA。
-    pub pause: PauseController,
     pub afa: AfaController,
     pub game_keys: GameKeys,
     /// 干员名 → 头像模板，用于在部署栏里认出这张卡。
@@ -107,7 +102,6 @@ impl Session {
             projection,
             templates,
             touch: TouchInjector::new(),
-            pause: PauseController::new(&game_keys),
             afa,
             game_keys,
             avatars: HashMap::new(),
@@ -180,6 +174,65 @@ impl Session {
         names
     }
 
+    /// 目标头像是否能在当前部署栏中唯一命中。
+    pub fn deploy_target_visible(&mut self, name: &str) -> Result<bool> {
+        let cards = self.scan_deployment()?;
+        let Some(avatar) = self.avatars.get(name) else {
+            return Ok(false);
+        };
+        Ok(cards
+            .iter()
+            .filter(|card| {
+                repl_vision::track(
+                    std::slice::from_ref(*card),
+                    avatar,
+                    card.tracking_threshold(),
+                )
+                .is_some()
+            })
+            .count()
+            == 1)
+    }
+
+    /// 从一次既有扫描中筛出没有被任何 Session/global/profile 头像解释的可见卡片。
+    /// 开局是否需要再次弹绑定面板只由这个集合决定，不能被尚未出现的作业名称驱动。
+    pub fn unrecognized_cards(&self, cards: &[Card]) -> Vec<Card> {
+        cards
+            .iter()
+            .filter(|card| {
+                !self.avatars.values().any(|avatar| {
+                    repl_vision::track(
+                        std::slice::from_ref(*card),
+                        avatar,
+                        card.tracking_threshold(),
+                    )
+                    .is_some()
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// 延迟绑定候选：排除被其他已知目标唯一解释的卡片，但保留当前目标历史头像
+    /// 命中的卡片，以便历史档案出现多卡歧义时让用户人工确认。
+    pub fn deferred_binding_candidates(&mut self, target: &str) -> Result<Vec<Card>> {
+        let cards = self.scan_deployment()?;
+        Ok(cards
+            .into_iter()
+            .filter(|card| {
+                !self.avatars.iter().any(|(name, avatar)| {
+                    name != target
+                        && repl_vision::track(
+                            std::slice::from_ref(card),
+                            avatar,
+                            card.tracking_threshold(),
+                        )
+                        .is_some()
+                })
+            })
+            .collect())
+    }
+
     /// 执行一个动作。`before_input` 会在准备工作完成后、首个会影响游戏的输入前调用。
     pub fn execute<F>(&mut self, action: &Action, mut before_input: F) -> Result<()>
     where
@@ -227,10 +280,12 @@ impl Session {
             .context("AFA 普通恢复热键失败")
     }
 
-    /// 逐帧推进仍由 Rust 直接控制；这是运行期唯一的直接暂停脉冲入口。
-    pub fn pulse(&self, gap: Duration) -> Result<()> {
+    /// 通过 AFA 的 `33ms` 动作推进 1 倍速单帧。失焦时直接失败，不盲目重试。
+    pub fn pulse(&self) -> Result<()> {
         self.ensure_foreground()?;
-        self.pause.pulse(gap).context("逐帧脉冲失败")
+        self.afa
+            .dispatch(AfaAction::StepOneX)
+            .context("AFA 逐帧热键失败")
     }
 
     fn ensure_foreground(&self) -> Result<()> {
@@ -322,7 +377,7 @@ impl Session {
         Ok(())
     }
 
-    /// 技能动作完全交给 AFA：复刻器只把目标干员交给当前鼠标位置，再触发 AFA 热键。
+    /// 技能动作完全交给 AFA：复刻器只把目标干员或地图装置交给当前鼠标位置，再触发 AFA 热键。
     fn do_skill<F>(&mut self, action: &Action, before_input: &mut F) -> Result<()>
     where
         F: FnMut() -> Result<()>,
@@ -365,7 +420,7 @@ impl Session {
             .or_else(|| self.battlefield.get(&action.name).copied())
             .ok_or_else(|| {
                 anyhow!(
-                    "不知道干员「{}」在场上哪个格子。请在作业里给这个动作补上 location",
+                    "不知道目标「{}」在场上哪个格子。请在作业里给这个动作补上 location",
                     action.name
                 )
             })?;

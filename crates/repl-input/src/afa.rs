@@ -22,6 +22,7 @@ const PRESS_PAUSE: &str = "PressPause";
 const RELEASE_PAUSE: &str = "ReleasePause";
 const PAUSE_SKILL: &str = "PauseSkill";
 const PAUSE_RETREAT: &str = "PauseRetreat";
+const STEP_ONE_X: &str = "33ms";
 // AFA 发布工作流的固定资产名；进程必须以同等管理员权限运行。
 const AFA_PROCESS: &str = "AFA.exe";
 
@@ -36,9 +37,9 @@ pub enum AfaAction {
     ReleasePause,
     PauseSkill,
     PauseRetreat,
+    /// AFA 的 1 倍速单帧过帧动作（配置协议名 `33ms`）。
+    StepOneX,
 }
-
-impl AfaAction {}
 
 /// AFA 热键解析结果。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,12 +65,20 @@ pub struct AfaBindings {
     pub release_pause: AfaHotkey,
     pub pause_skill: AfaHotkey,
     pub pause_retreat: AfaHotkey,
+    /// AFA 的 1 倍速单帧过帧热键；主复刻逐帧推进使用该动作。
+    pub step_one_x: AfaHotkey,
 }
 
 impl AfaBindings {
     fn from_ini(values: &IniValues) -> Result<Self, AfaError> {
         let mut bindings = Vec::new();
-        for key in [PRESS_PAUSE, RELEASE_PAUSE, PAUSE_SKILL, PAUSE_RETREAT] {
+        for key in [
+            PRESS_PAUSE,
+            RELEASE_PAUSE,
+            PAUSE_SKILL,
+            PAUSE_RETREAT,
+            STEP_ONE_X,
+        ] {
             let value = values
                 .get(&("Hotkeys".to_owned(), key.to_owned()))
                 .map(String::as_str)
@@ -94,6 +103,7 @@ impl AfaBindings {
             release_pause: bindings[1].1,
             pause_skill: bindings[2].1,
             pause_retreat: bindings[3].1,
+            step_one_x: bindings[4].1,
         })
     }
 
@@ -103,6 +113,7 @@ impl AfaBindings {
             AfaAction::ReleasePause => self.release_pause,
             AfaAction::PauseSkill => self.pause_skill,
             AfaAction::PauseRetreat => self.pause_retreat,
+            AfaAction::StepOneX => self.step_one_x,
         }
     }
 }
@@ -129,11 +140,12 @@ impl AfaController {
         let process_id = validate_afa_process(None, find_afa_process())?;
         if log_bindings {
             log::info!(
-                "AFA 热键解析：{PRESS_PAUSE}={}, {RELEASE_PAUSE}={}, {PAUSE_SKILL}={}, {PAUSE_RETREAT}={} (source={})",
+                "AFA 热键解析：{PRESS_PAUSE}={}, {RELEASE_PAUSE}={}, {PAUSE_SKILL}={}, {PAUSE_RETREAT}={}, {STEP_ONE_X}={} (source={})",
                 bindings.press_pause,
                 bindings.release_pause,
                 bindings.pause_skill,
                 bindings.pause_retreat,
+                bindings.step_one_x,
                 settings_path.display(),
             );
             log::info!(
@@ -487,6 +499,7 @@ mod tests {
             (RELEASE_PAUSE, "Space"),
             (PAUSE_SKILL, "XButton2"),
             (PAUSE_RETREAT, "XButton1"),
+            (STEP_ONE_X, "r"),
         ]
         .into_iter()
         .map(|(key, value)| (("Hotkeys".to_owned(), key.to_owned()), value.to_owned()))
@@ -558,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_all_four_configured_bindings() {
+    fn parses_all_required_bindings() {
         let bindings = AfaBindings::from_ini(&valid_hotkey_values()).expect("valid bindings");
 
         assert_eq!(
@@ -574,6 +587,10 @@ mod tests {
             bindings.pause_retreat,
             AfaHotkey::XButton(mouse::XButton::XButton1)
         );
+        assert_eq!(
+            bindings.step_one_x,
+            AfaHotkey::Keyboard(KeyCode::from_ascii('r').unwrap())
+        );
 
         assert_eq!(bindings.get(AfaAction::PressPause), bindings.press_pause);
         assert_eq!(
@@ -585,11 +602,18 @@ mod tests {
             bindings.get(AfaAction::PauseRetreat),
             bindings.pause_retreat
         );
+        assert_eq!(bindings.get(AfaAction::StepOneX), bindings.step_one_x);
     }
 
     #[test]
     fn rejects_each_missing_or_blank_binding() {
-        for missing in [PRESS_PAUSE, RELEASE_PAUSE, PAUSE_SKILL, PAUSE_RETREAT] {
+        for missing in [
+            PRESS_PAUSE,
+            RELEASE_PAUSE,
+            PAUSE_SKILL,
+            PAUSE_RETREAT,
+            STEP_ONE_X,
+        ] {
             let mut values = valid_hotkey_values();
             values.remove(&("Hotkeys".to_owned(), missing.to_owned()));
             assert!(matches!(
@@ -620,6 +644,20 @@ mod tests {
         assert!(matches!(
             AfaBindings::from_ini(&values),
             Err(AfaError::DuplicateHotkey { value }) if value == "  G  "
+        ));
+    }
+
+    #[test]
+    fn rejects_step_binding_that_duplicates_a_required_action() {
+        let mut values = valid_hotkey_values();
+        values.insert(
+            ("Hotkeys".to_owned(), STEP_ONE_X.to_owned()),
+            " G ".to_owned(),
+        );
+
+        assert!(matches!(
+            AfaBindings::from_ini(&values),
+            Err(AfaError::DuplicateHotkey { value }) if value == " G "
         ));
     }
 
@@ -769,7 +807,7 @@ mod tests {
     fn read_ini_accepts_utf16_bom_files_written_by_afa() {
         let contents = "[Main]\r\nAutoBeginPause=1\r\nDefaultStrongHoldProtocol=0\r\n\
                         [Hotkeys]\r\nPressPause=g\r\nReleasePause=Space\r\n\
-                        PauseSkill=XButton2\r\nPauseRetreat=XButton1\r\n";
+                        PauseSkill=XButton2\r\nPauseRetreat=XButton1\r\n33ms=r\r\n";
 
         for (bom, words) in [
             ([0xFF, 0xFE], contents.encode_utf16().collect::<Vec<_>>()),
@@ -787,7 +825,7 @@ mod tests {
             let (values, _) = result.expect("parse UTF-16 AFA INI");
 
             validate_main_settings(&values).expect("validate main settings");
-            AfaBindings::from_ini(&values).expect("parse all four AFA bindings");
+            AfaBindings::from_ini(&values).expect("parse all five AFA bindings");
         }
     }
 

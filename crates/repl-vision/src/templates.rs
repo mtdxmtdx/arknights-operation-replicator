@@ -95,6 +95,27 @@ impl TemplateSet {
     }
 }
 
+/// 从 MAA 资源目录按文件名加载一张模板。
+///
+/// 编队识别与部署栏识别共用同一套递归索引规则；资源升级只移动子目录时不应失效。
+pub(crate) fn load_named_template(
+    resource_dir: &Path,
+    name: &str,
+    mask: Option<(u8, u8)>,
+) -> Result<Template, TemplateLoadError> {
+    let index = build_index(resource_dir)?;
+    let mut matches = index
+        .iter()
+        .filter(|path| path.file_name().is_some_and(|file| file == name));
+    let path = matches
+        .next()
+        .ok_or_else(|| TemplateLoadError::Missing(name.to_owned()))?;
+    if matches.next().is_some() {
+        return Err(TemplateLoadError::Duplicate(name.to_owned()));
+    }
+    load_png(path, name, mask)
+}
+
 /// 自动定位 MAA 的 `resource` 目录。
 ///
 /// 顺序：`REPLICATOR_MAA_RESOURCE` 环境变量 → 当前目录及各级父目录下的
@@ -182,6 +203,8 @@ pub enum TemplateLoadError {
     ResourceDirInvalid(String),
     #[error("MAA 资源目录里找不到模板 {0}")]
     Missing(String),
+    #[error("MAA 资源目录里存在多份同名模板 {0}，无法确定应使用哪一份")]
+    Duplicate(String),
     #[error("解码 {0} 失败：{1}")]
     Decode(String, String),
     #[error("模板 {0} 不可用：{1}")]
