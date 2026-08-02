@@ -5,8 +5,9 @@
 与 MAA 的自动战斗相比，唯一但决定性的区别：**每一步的等待条件不是视觉事件
 （击杀数 / 费用 / 技能就绪），而是绝对逻辑帧。**
 
-```
-用户进关并由 AFA 暂停 → 点击开始 → 手动切回游戏焦点 → 编队准备 → 接管尺子帧 → 正常运行 → 提前暂停 → 逐帧推进 → 注入动作 → 下一动作
+```text
+可选战前扫描并人工确认 → 用户进关并由 AFA 暂停 → 点击开始 → 手动切回游戏 → 编队准备
+→ 再次手动切回游戏 → 接管尺子帧 → 正常运行 → AFA 提前暂停/逐帧 → 注入动作 → 尺子确认 → 下一动作
 ```
 
 ## 状态
@@ -16,6 +17,10 @@
 [当前版本实机验收](docs/REAL_MACHINE_ACCEPTANCE.md) 为唯一入口。暂停、恢复、逐帧、技能和撤退由 AFA 执行，
 复刻器只在派发后的新尺子样本确认目标帧与暂停状态后才把动作标记为完成。
 
+2026-08-02 的 `develop` 版本新增人工作业编辑器、风险确认式继续、召唤物/装置延迟绑定、MAA 兼容
+战前编队 OCR/F0 头像桥接，并修复部署方向触控越界。代码和自动门禁已通过并同步 `develop`；这些
+新增能力仍须按实机验收手册 §5–§9 验证，不能沿用 M8/M9 的历史通过结论。
+
 | 验收节 | 状态 |
 | --- | --- |
 | 1 帧源接入 | ✅ 实机通过（2026-07-26） |
@@ -24,8 +29,11 @@
 | 4 部署栏识别 | 🟡 旗标/先锋实机通过；多职业未知降级待实机复验 |
 | 5 端到端复刻 | ✅ M8 实机通过（2026-07-29）；M9 录像与 CSV 10/10 通过（2026-07-30） |
 | 6 资源占用 | 🟡 静态加入 ONNX Runtime 后当前二进制约 32.7 MiB；运行内存待复测 |
+| 7 编辑器、继续与延迟绑定 | 🟡 已实现并通过自动门禁；GUI 和真实召唤物链路待实机验收 |
+| 8 战前编队 OCR/F0 桥接 | 🟡 已实现并通过资源初始化/逻辑测试；真实编队待实机验收 |
+| 9 部署方向边界修复 | 🟡 自动回归通过；用户本地 test2 F483 与四方向边缘待实机验收 |
 
-输入适配、AFA 解析和动作确认测试已通过；`cargo test --workspace`、clippy、release 构建、
+输入适配、AFA 解析和动作确认测试已通过；`cargo test --workspace` 当前共 248 项，clippy、release 构建、
 格式检查和 diff 检查均已通过。M8 实机已确认启动门禁、焦点交接、绑定路径、AFA
 Resume/Pause 委托、Deploy → Skill → Retreat、零跨帧和最终目标帧暂停；当前 AFA 逐帧构建已由
 用户确认 M9 10/10。带风险的“继续”运行仍不能计入 M9。
@@ -39,8 +47,8 @@ Resume/Pause 委托、Deploy → Skill → Retreat、零跨帧和最终目标帧
    关闭卫戍协议默认模式。AFA 不可用时复刻器不会回退旧 Rust 时序。
 3. **[ArknightsCostBarRuler](https://github.com/ZeroAd-06/ArknightsCostBarRuler)** 独立运行，
    并已完成一次费用条校准。它是帧数的唯一真源，复刻器通过其 `127.0.0.1:2606`
-   本地 API 读取绝对帧。
-4. 一份 **MAA 资源目录**（`resource/`），用于地图格子投影和部署栏识别。可以是已安装的
+   WebSocket（`ws://127.0.0.1:2606`）读取绝对帧；HTTP 探测不是受支持路径。
+4. 一份 **MAA 资源目录**（`resource/`），用于地图投影、部署栏识别和可选的战前编队 OCR。可以是已安装的
    [MaaAssistantArknights](https://github.com/MaaAssistantArknights/MaaAssistantArknights)，
    也可以单独获取其资源仓库。**本仓库不分发这些游戏资源文件**，首次运行向导会让你指定路径。
 
@@ -50,6 +58,7 @@ Resume/Pause 委托、Deploy → Skill → Retreat、零跨帧和最终目标帧
 
 ```powershell
 cargo build --release
+.\target\release\repl-app.exe
 ```
 
 产物在 `target/release/`：
@@ -66,7 +75,7 @@ cargo build --release
 | `formation-scan.exe` | 战前编队 OCR 只读诊断（不发送任何输入） |
 
 第一次用请先走一遍 [完整验收手册](ACCEPTANCE.md)；验证当前开发构建时再执行
-[M8/M9 实机验收](docs/REAL_MACHINE_ACCEPTANCE.md)。
+[当前版本实机验收](docs/REAL_MACHINE_ACCEPTANCE.md)。
 
 ## 人工作业编辑器
 
@@ -105,7 +114,7 @@ Resume/Pause/Pulse 时序，也可用于端到端精确验收；首动作没有�
 crates/
 ├─ repl-core/    纯逻辑：作业模型、地图投影、坐标映射、部署手势、帧复刻状态机
 ├─ repl-frames/  尺子的 WebSocket 客户端
-├─ repl-input/   触控注入（InjectTouchInput）、键盘、游戏内键位、逐帧脉冲
+├─ repl-input/   触控注入、AFA 热键适配、键盘/鼠标；旧 Rust 脉冲仅供诊断
 ├─ repl-vision/  部署栏识别、MAA 兼容战前 OCR 与头像桥接（不依赖 OpenCV）
 ├─ repl-capture/ 窗口定位 + Windows Graphics Capture 按需截图
 └─ repl-app/     Slint 界面、配置、编排

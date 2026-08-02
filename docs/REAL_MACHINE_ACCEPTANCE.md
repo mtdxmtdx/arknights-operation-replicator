@@ -7,7 +7,7 @@
 
 | 项目 | 当前值 |
 | --- | --- |
-| 源码分支 | 本地 `develop`，比 `origin/develop` 领先 4 个提交，尚未推送 |
+| 源码分支 | `develop`，本次实现与知识收尾已同步 `origin/develop` |
 | 可执行文件 | `D:\Arknights Operation Replicator\replicator\target\release\repl-app.exe` |
 | 当前本地构建 | `34,304,512` 字节；SHA-256 `DDDF66FB6DB4ED083DD73A8B7634B9909785151B2EA7FF9601D64CDB2A78BF7F` |
 | M8 验收基线文件大小 | `14,710,272` 字节 |
@@ -223,8 +223,8 @@ Set-Location -LiteralPath 'D:\Arknights Operation Replicator\replicator'
 
 ## 7. 延迟召唤物 / 装置绑定
 
-使用包含召唤师及召唤物 Deploy 的 `test2` 作业。验收前保留 `bindings.json` 备份；只删除明确要重测
-的召唤物头像档案，不删除整个文件。
+使用用户本地、包含召唤师及召唤物 Deploy 的 `test2` 作业（该作业不随仓库分发）。验收前保留
+`bindings.json` 备份；只删除明确要重测的召唤物头像档案，不删除整个文件。
 
 1. 第一次运行时，开局面板只要求当前部署栏可见干员；召唤物留空仍可确认。
 2. 到首个召唤物 Deploy 目标帧后，游戏保持暂停并弹出“新增召唤物绑定”；只显示未被其他历史头像
@@ -287,7 +287,8 @@ if ($LASTEXITCODE -ne 0) { throw "formation-scan failed: $LASTEXITCODE" }
 
 ## 9. F483 向上部署触控边界
 
-使用 `examples\test2.json`，保持 2560×1440 客户区并运行到 F483 的“女妖车”向上部署：
+使用用户本地 `examples\test2.json`（不随仓库分发），保持 2560×1440 客户区并运行到 F483 的
+“女妖车”向上部署：
 
 1. 确认女妖车落在 `(7, 2)` 且朝向为上；部署后保持目标帧暂停。
 2. 日志不得再出现 `(1838, -56)`、其他负触控坐标、`参数错误 (0x80070057)` 或
