@@ -9,13 +9,19 @@
 
 //! `repl-vision` —— 部署栏识别。
 //!
-//! 只需要归一化互相关模板匹配，纯 Rust 实现，不引入 OpenCV。
-//! 模板 PNG 不随本仓库分发，运行时从用户配置的 MAA 资源目录读取。
+//! 部署栏跟踪与战前头像桥接使用纯 Rust 归一化互相关，不引入 OpenCV；战前姓名识别使用静态链接的
+//! ONNX Runtime 运行 MAA PaddleOCR 模型。模板、模型和字典不随仓库分发，运行时从 MAA 资源读取。
 
 pub mod deployment;
+pub mod formation;
 pub mod ncc;
 pub mod templates;
 
 pub use deployment::{analyze, battle_hud_visible, track, Card};
+pub use formation::{
+    bridge_formation_avatars, FormationAvatar, FormationBridgeMatch, FormationError,
+    FormationResources, FormationScanReport, FormationScanRow, FormationScanner,
+    FormationTaskConfig, OperatorCatalog, OperatorKey, SuggestionSource,
+};
 pub use ncc::{best_match, find_all, Match, Template, TemplateError};
 pub use templates::{TemplateLoadError, TemplateSet};

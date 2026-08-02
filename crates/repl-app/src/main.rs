@@ -7,12 +7,14 @@
 
 use std::{
     cell::RefCell,
+    collections::HashMap,
+    hash::{Hash, Hasher},
     rc::Rc,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use repl_app::{
@@ -20,7 +22,7 @@ use repl_app::{
     editor::EditorState,
     runner::{
         continuation_sample_ready, continuation_snapshot_plan, start_snapshot_ready, BindingMode,
-        Progress, RunMode, Runner,
+        BindingRequest, Progress, RunMode, Runner,
     },
     session::Session,
 };
@@ -29,17 +31,63 @@ use repl_core::{
     DiagnosticSeverity, Direction, LevelPack, Point,
 };
 use repl_frames::{FrameSource, RulerClient};
-use slint::{Model, ModelRc, SharedString, VecModel};
+use slint::{Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
 
 slint::include_modules!();
 
 /// 用户在绑定面板里填的"卡片序号 → 干员名"。
 type BindingChoices = Vec<(usize, String)>;
 
+const FORMATION_PENDING_TTL: Duration = Duration::from_secs(30 * 60);
+
+struct FormationDraft {
+    report: repl_vision::FormationScanReport,
+    catalog: repl_vision::OperatorCatalog,
+    config: repl_vision::FormationTaskConfig,
+    selections: HashMap<usize, String>,
+    roster_fingerprint: u64,
+    game_hwnd: isize,
+    width: u32,
+    height: u32,
+    created_at: Instant,
+}
+
+#[derive(Clone)]
+struct PendingFormationScan {
+    confirmed: Vec<(repl_vision::OperatorKey, repl_vision::FormationAvatar)>,
+    config: repl_vision::FormationTaskConfig,
+    roster_fingerprint: u64,
+    game_hwnd: isize,
+    width: u32,
+    height: u32,
+    created_at: Instant,
+}
+
+type FormationScanMessage = (u64, Vec<String>, Result<FormationDraft, String>);
+
 /// 绑定面板与工作线程之间的握手：UI 线程在用户点"确认"时填入选择，
 /// 工作线程轮询取走。卡片数据走 `Progress::NeedsBinding` 事件，不经过这里。
 struct BindingBridge {
-    choices: Mutex<Option<BindingChoices>>,
+    response: Mutex<Option<BindingResponse>>,
+}
+
+enum BindingResponse {
+    Confirm(BindingChoices),
+    Cancel,
+}
+
+impl BindingBridge {
+    fn reset(&self) {
+        *self.response.lock().unwrap() = None;
+    }
+
+    fn submit(&self, response: BindingResponse) {
+        *self.response.lock().unwrap() = Some(response);
+    }
+
+    fn take(&self) -> Option<BindingResponse> {
+        self.response.lock().unwrap().take()
+    }
 }
 
 /// The UI window handle is captured on the Slint thread and used only to make the
@@ -114,6 +162,9 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.set_actions(ModelRc::new(VecModel::<ActionRow>::default()));
     ui.set_cards(ModelRc::new(VecModel::<CardRow>::default()));
     ui.set_unbound_opers(ModelRc::new(VecModel::<SharedString>::default()));
+    ui.set_binding_options(ModelRc::new(VecModel::from(vec![SharedString::from(
+        "— 当前卡片不绑定 —",
+    )])));
     ui.set_afa_ready(false);
     ui.set_afa_detail("未检测".into());
     ui.set_can_continue(false);
@@ -122,14 +173,23 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.set_editor_actions(ModelRc::new(VecModel::<EditorActionRow>::default()));
     ui.set_editor_diagnostics(ModelRc::new(VecModel::<DiagnosticRow>::default()));
     ui.set_editor_operators(ModelRc::new(VecModel::<SharedString>::default()));
+    ui.set_editor_deferred_targets(ModelRc::new(VecModel::<SharedString>::default()));
     ui.set_editor_operator_options(ModelRc::new(VecModel::from(vec![SharedString::from(
-        "— 选择干员 —",
+        "— 选择目标 —",
     )])));
     ui.set_editor_map_cells(ModelRc::new(VecModel::<MapCell>::default()));
+    ui.set_formation_rows(ModelRc::new(VecModel::<FormationRow>::default()));
+    ui.set_formation_options(ModelRc::new(VecModel::from(vec![SharedString::from(
+        "— 忽略此槽位 —",
+    )])));
 
     let ruler = Arc::new(RulerClient::connect(config.borrow().ruler_ws_url.clone()));
     let copilot: Rc<RefCell<Option<Copilot>>> = Rc::new(RefCell::new(None));
     let pending_continuation: Rc<RefCell<Option<ContinuationPlan>>> = Rc::new(RefCell::new(None));
+    let formation_draft: Rc<RefCell<Option<FormationDraft>>> = Rc::new(RefCell::new(None));
+    let pending_formation: Rc<RefCell<Option<PendingFormationScan>>> = Rc::new(RefCell::new(None));
+    let formation_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (formation_tx, formation_rx) = mpsc::channel::<FormationScanMessage>();
     let editor = Rc::new(RefCell::new(EditorState::default()));
     let level_pack = Rc::new(
         config
@@ -160,6 +220,9 @@ fn main() -> Result<(), slint::PlatformError> {
     // ——— 作业编辑器（纯文档操作，不创建 Session/AFA/输入注入）———
     {
         let ui_weak = ui.as_weak();
+        let formation_generation = Arc::clone(&formation_generation);
+        let formation_draft = Rc::clone(&formation_draft);
+        let pending_formation = Rc::clone(&pending_formation);
         ui.on_switch_mode(move |editor_mode| {
             let Some(ui) = ui_weak.upgrade() else { return };
             if ui.get_running() {
@@ -167,6 +230,11 @@ fn main() -> Result<(), slint::PlatformError> {
             }
             ui.set_editor_mode(editor_mode);
             if editor_mode {
+                formation_generation.fetch_add(1, Ordering::Relaxed);
+                *formation_draft.borrow_mut() = None;
+                *pending_formation.borrow_mut() = None;
+                ui.set_formation_scanning(false);
+                ui.set_formation_visible(false);
                 ui.set_afa_ready(false);
                 ui.set_afa_detail("编辑模式不探测".into());
                 ui.set_game_found(false);
@@ -184,6 +252,53 @@ fn main() -> Result<(), slint::PlatformError> {
             *editor.borrow_mut() = EditorState::default();
             refresh_editor(&ui, &editor.borrow(), &copilot);
             refresh_editor_map(&ui, level_pack.as_ref().as_ref(), &editor.borrow());
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let editor = Rc::clone(&editor);
+        let copilot = Rc::clone(&copilot);
+        ui.on_editor_add_deferred_target(move |name| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let name = name.trim();
+            if name.is_empty()
+                || editor
+                    .borrow()
+                    .document()
+                    .target_names()
+                    .iter()
+                    .any(|n| n == name)
+            {
+                return;
+            }
+            editor.borrow_mut().add_deferred_target(name);
+            refresh_editor(&ui, &editor.borrow(), &copilot);
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let editor = Rc::clone(&editor);
+        let copilot = Rc::clone(&copilot);
+        ui.on_editor_rename_deferred_target(move |old_name, new_name| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let new_name = new_name.trim();
+            if new_name.is_empty() {
+                return;
+            }
+            editor
+                .borrow_mut()
+                .rename_deferred_target(old_name.as_str(), new_name);
+            refresh_editor(&ui, &editor.borrow(), &copilot);
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let editor = Rc::clone(&editor);
+        let copilot = Rc::clone(&copilot);
+        ui.on_editor_remove_deferred_target(move |name| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            editor.borrow_mut().remove_deferred_target(name.as_str());
+            refresh_editor(&ui, &editor.borrow(), &copilot);
         });
     }
     {
@@ -480,6 +595,9 @@ fn main() -> Result<(), slint::PlatformError> {
         let ui_weak = ui.as_weak();
         let copilot = Rc::clone(&copilot);
         let log = Rc::clone(&log);
+        let formation_draft = Rc::clone(&formation_draft);
+        let pending_formation = Rc::clone(&pending_formation);
+        let formation_generation = Arc::clone(&formation_generation);
         ui.on_load_job(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let Some(path) = pick_job_file() else { return };
@@ -488,6 +606,10 @@ fn main() -> Result<(), slint::PlatformError> {
                 .and_then(|text| Copilot::parse(&text).map_err(|e| e.to_string()))
             {
                 Ok(job) => {
+                    formation_generation.fetch_add(1, Ordering::Relaxed);
+                    *formation_draft.borrow_mut() = None;
+                    *pending_formation.borrow_mut() = None;
+                    ui.set_formation_visible(false);
                     ui.set_job_name(
                         format!(
                             "{} · {} 个动作 · 关卡 {}",
@@ -520,9 +642,166 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
 
+    // ——— 战前编队扫描（只读截图 + 本地 OCR，不创建 Session/AFA/输入）———
+    {
+        let ui_weak = ui.as_weak();
+        let copilot = Rc::clone(&copilot);
+        let config = Rc::clone(&config);
+        let pending = Rc::clone(&pending_formation);
+        let generation = Arc::clone(&formation_generation);
+        let tx = formation_tx.clone();
+        ui.on_scan_formation(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            if ui.get_running() || ui.get_editor_mode() {
+                ui.set_status_line("请在复刻执行模式、未运行时扫描编队".into());
+                return;
+            }
+            let Some(job) = copilot.borrow().clone() else {
+                ui.set_status_line("请先装载作业".into());
+                return;
+            };
+            let job_names = job.oper_names();
+            let config = config.borrow().clone();
+            let current_generation = generation.fetch_add(1, Ordering::Relaxed) + 1;
+            *pending.borrow_mut() = None;
+            ui.set_formation_scanning(true);
+            ui.set_formation_visible(false);
+            ui.set_status_line("正在只读扫描战前编队…".into());
+            let result_tx = tx.clone();
+            std::thread::Builder::new()
+                .name("formation-scan".into())
+                .spawn(move || {
+                    let result =
+                        scan_formation(&job, &config).map_err(|error| format!("{error:#}"));
+                    let _ = result_tx.send((current_generation, job_names, result));
+                })
+                .expect("failed to spawn formation scan thread");
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let draft = Rc::clone(&formation_draft);
+        let pending = Rc::clone(&pending_formation);
+        let generation = Arc::clone(&formation_generation);
+        let log = Rc::clone(&log);
+        let timer = slint::Timer::default();
+        timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(50),
+            move || {
+                let Some(ui) = ui_weak.upgrade() else { return };
+                while let Ok((result_generation, job_names, result)) = formation_rx.try_recv() {
+                    if result_generation != generation.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    ui.set_formation_scanning(false);
+                    match result {
+                        Ok(mut value) => {
+                            let detail = present_formation_scan(&ui, &mut value, &job_names);
+                            append_log(&ui, &log, &format!("编队扫描完成：{detail}"));
+                            *pending.borrow_mut() = None;
+                            *draft.borrow_mut() = Some(value);
+                        }
+                        Err(error) => {
+                            let message = format!("编队扫描失败：{error}");
+                            ui.set_status_line(message.clone().into());
+                            append_log(&ui, &log, &message);
+                        }
+                    }
+                }
+            },
+        );
+        std::mem::forget(timer);
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let draft = Rc::clone(&formation_draft);
+        ui.on_formation_select(move |slot, name| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let mut draft_guard = draft.borrow_mut();
+            let Some(draft) = draft_guard.as_mut() else {
+                return;
+            };
+            let name = name.trim();
+            draft.selections.retain(|existing_slot, existing_name| {
+                *existing_slot != slot as usize && (name.is_empty() || existing_name != name)
+            });
+            if !name.is_empty() {
+                draft.selections.insert(slot as usize, name.to_owned());
+            }
+            let options = ui.get_formation_options();
+            let selected_index = (0..options.row_count())
+                .find(|index| {
+                    options
+                        .row_data(*index)
+                        .is_some_and(|value| value.as_str() == name)
+                })
+                .unwrap_or(0) as i32;
+            let rows = ui.get_formation_rows();
+            for index in 0..rows.row_count() {
+                let Some(mut row) = rows.row_data(index) else {
+                    continue;
+                };
+                if row.slot == slot {
+                    row.selected_index = selected_index;
+                } else if !name.is_empty() && row.selected_index == selected_index {
+                    row.selected_index = 0;
+                }
+                rows.set_row_data(index, row);
+            }
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let draft = Rc::clone(&formation_draft);
+        let pending = Rc::clone(&pending_formation);
+        ui.on_formation_confirm(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let draft_guard = draft.borrow();
+            let Some(draft) = draft_guard.as_ref() else {
+                return;
+            };
+            let mut confirmed = Vec::new();
+            for row in &draft.report.rows {
+                let Some(name) = draft.selections.get(&row.slot) else {
+                    continue;
+                };
+                let Some(avatar) = row.avatar.clone() else {
+                    continue;
+                };
+                confirmed.push((draft.catalog.operator_for_job_name(name), avatar));
+            }
+            *pending.borrow_mut() = Some(PendingFormationScan {
+                confirmed,
+                config: draft.config.clone(),
+                roster_fingerprint: draft.roster_fingerprint,
+                game_hwnd: draft.game_hwnd,
+                width: draft.width,
+                height: draft.height,
+                created_at: draft.created_at,
+            });
+            ui.set_formation_visible(false);
+            ui.set_status_line("编队识别已确认；进入关卡后点击开始复刻".into());
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let draft = Rc::clone(&formation_draft);
+        let pending = Rc::clone(&pending_formation);
+        let generation = Arc::clone(&formation_generation);
+        ui.on_formation_cancel(move || {
+            generation.fetch_add(1, Ordering::Relaxed);
+            *draft.borrow_mut() = None;
+            *pending.borrow_mut() = None;
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_formation_visible(false);
+            }
+        });
+    }
+
     // ——— 绑定桥 ———
     let bridge = Arc::new(BindingBridge {
-        choices: Mutex::new(None),
+        response: Mutex::new(None),
     });
     let pending_choices: Rc<RefCell<BindingChoices>> = Rc::new(RefCell::new(Vec::new()));
     // 本次绑定要求的干员名单（来自 NeedsBinding 事件），用来实时计算"还没绑定"。
@@ -535,14 +814,38 @@ fn main() -> Result<(), slint::PlatformError> {
         ui.on_bind_card(move |index, name| {
             let mut pending = pending.borrow_mut();
             let index = index as usize;
-            pending.retain(|(i, _)| *i != index);
-            if !name.trim().is_empty() {
-                pending.push((index, name.trim().to_owned()));
+            let name = name.trim();
+            pending.retain(|(i, existing)| *i != index && (name.is_empty() || existing != name));
+            if !name.is_empty() {
+                pending.push((index, name.to_owned()));
             }
             // 实时刷新"还没绑定"列表 —— 确认按钮的可用性就靠它。
             // 只认作业里声明过的名字：填错名字不会让按钮亮起来，
             // 用户能立刻从"还没绑定：N 名干员"看出有问题。
             if let Some(ui) = ui_weak.upgrade() {
+                let cards = ui.get_cards();
+                let options = ui.get_binding_options();
+                let selected_index = (0..options.row_count())
+                    .find(|row| {
+                        options
+                            .row_data(*row)
+                            .is_some_and(|value| value.as_str() == name)
+                    })
+                    .unwrap_or(0) as i32;
+                for row_index in 0..cards.row_count() {
+                    let Some(mut row) = cards.row_data(row_index) else {
+                        continue;
+                    };
+                    if row.index == index as i32 {
+                        row.bound_to = name.into();
+                        row.selected_index = selected_index;
+                        cards.set_row_data(row_index, row);
+                    } else if !name.is_empty() && row.bound_to.as_str() == name {
+                        row.bound_to = SharedString::new();
+                        row.selected_index = 0;
+                        cards.set_row_data(row_index, row);
+                    }
+                }
                 let assigned: Vec<&str> = pending.iter().map(|(_, n)| n.as_str()).collect();
                 let unbound: Vec<SharedString> = opers
                     .borrow()
@@ -559,9 +862,21 @@ fn main() -> Result<(), slint::PlatformError> {
         let bridge = Arc::clone(&bridge);
         let pending = Rc::clone(&pending_choices);
         ui.on_binding_confirm(move || {
-            *bridge.choices.lock().unwrap() = Some(pending.borrow().clone());
+            bridge.submit(BindingResponse::Confirm(pending.borrow().clone()));
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_binding_submitting(true);
+                ui.set_status_line("正在校验并保存绑定，请勿关闭程序…".into());
+            }
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let bridge = Arc::clone(&bridge);
+        ui.on_binding_cancel(move || {
+            bridge.submit(BindingResponse::Cancel);
             if let Some(ui) = ui_weak.upgrade() {
                 ui.set_binding_visible(false);
+                ui.set_binding_submitting(false);
             }
         });
     }
@@ -577,11 +892,16 @@ fn main() -> Result<(), slint::PlatformError> {
         let log = Rc::clone(&log);
         let pending_choices = Rc::clone(&pending_choices);
         let binding_opers = Rc::clone(&binding_opers);
+        let pending_formation = Rc::clone(&pending_formation);
 
         ui.on_start_run(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             if ui.get_editor_mode() {
                 ui.set_status_line("编辑模式严格禁止输入；请先切到「复刻执行」".into());
+                return;
+            }
+            if ui.get_formation_scanning() {
+                ui.set_status_line("编队扫描尚未完成，请等待或取消".into());
                 return;
             }
             let Some(job) = copilot.borrow().clone() else {
@@ -617,12 +937,27 @@ fn main() -> Result<(), slint::PlatformError> {
                 append_log(&ui, &log, &message);
                 return;
             }
+            let formation = match pending_formation.borrow_mut().take() {
+                Some(pending) => match validate_pending_formation(&pending, &job) {
+                    Ok(()) => Some(pending),
+                    Err(error) => {
+                        append_log(
+                            &ui,
+                            &log,
+                            &format!("战前编队识别已失效，将回退到既有/人工绑定：{error}"),
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
             launch_run(
                 &ui,
                 ui_weak.clone(),
                 job,
                 config.borrow().clone(),
                 RunMode::FromZero,
+                formation,
                 Arc::clone(&ruler),
                 Arc::clone(&cancel),
                 Arc::clone(&bridge),
@@ -817,6 +1152,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 job,
                 config.borrow().clone(),
                 RunMode::Continue(plan),
+                None,
                 Arc::clone(&ruler),
                 Arc::clone(&cancel),
                 Arc::clone(&bridge),
@@ -963,6 +1299,173 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.run()
 }
 
+fn scan_formation(job: &Copilot, config: &Config) -> anyhow::Result<FormationDraft> {
+    let job_names = job.oper_names();
+    if job_names.is_empty() {
+        anyhow::bail!("作业 opers 为空，没有可确认的开局编队");
+    }
+    let resource_dir = config
+        .resolve_maa_resource_dir()
+        .ok_or_else(|| anyhow::anyhow!("找不到可用的 MAA resource 目录"))?;
+    let window = repl_capture::GameWindow::find()?;
+    let geometry = window.geometry()?;
+    let ui_scaler = config
+        .ui_scaler_override
+        .or_else(|| repl_input::game_keys::read_ui_scaler().ok().flatten())
+        .unwrap_or(repl_core::viewport::DEFAULT_UI_SCALER);
+    let viewport = repl_core::Viewport::new(geometry.width, geometry.height, ui_scaler);
+    let mut capturer = repl_capture::WindowCapturer::new(window)?;
+    let raw = capturer.grab()?;
+    let reference = raw.resample(
+        viewport.reference_source(),
+        repl_core::REF_WIDTH as u32,
+        repl_core::REF_HEIGHT as u32,
+    );
+    let resources = repl_vision::FormationResources::load(&resource_dir)?;
+    let catalog = resources.catalog.clone();
+    let task_config = resources.config.clone();
+    let mut scanner = repl_vision::FormationScanner::new(resources)?;
+    let report = scanner.scan(&reference, &job_names)?;
+    Ok(FormationDraft {
+        report,
+        catalog,
+        config: task_config,
+        selections: HashMap::new(),
+        roster_fingerprint: roster_fingerprint(&job_names),
+        game_hwnd: window.raw_handle(),
+        width: geometry.width,
+        height: geometry.height,
+        created_at: Instant::now(),
+    })
+}
+
+fn formation_image(avatar: &repl_vision::FormationAvatar) -> Image {
+    let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(avatar.width, avatar.height);
+    for (target, source) in buffer
+        .make_mut_bytes()
+        .chunks_exact_mut(4)
+        .zip(avatar.bgra.chunks_exact(4))
+    {
+        target.copy_from_slice(&[source[2], source[1], source[0], source[3]]);
+    }
+    Image::from_rgba8(buffer)
+}
+
+fn present_formation_scan(
+    ui: &MainWindow,
+    value: &mut FormationDraft,
+    job_names: &[String],
+) -> String {
+    value.roster_fingerprint = roster_fingerprint(job_names);
+    let mut options = vec![SharedString::from("— 忽略此槽位 —")];
+    options.extend(job_names.iter().map(SharedString::from));
+    let mut rows = Vec::with_capacity(value.report.rows.len());
+    for row in &value.report.rows {
+        let selected_name = row
+            .default_selected
+            .then_some(row.suggestion.as_ref())
+            .flatten()
+            .map(|operator| operator.display_name.as_str())
+            .unwrap_or("");
+        if !selected_name.is_empty() {
+            value.selections.insert(row.slot, selected_name.to_owned());
+        }
+        let selected_index = job_names
+            .iter()
+            .position(|name| name == selected_name)
+            .map_or(0, |index| index + 1) as i32;
+        rows.push(FormationRow {
+            slot: row.slot as i32,
+            avatar: row
+                .avatar
+                .as_ref()
+                .map_or_else(Image::default, formation_image),
+            raw_text: row.raw_text.as_str().into(),
+            confidence: format!("{:.1}%", row.confidence * 100.0).into(),
+            suggestion: row
+                .suggestion
+                .as_ref()
+                .map_or("", |operator| operator.display_name.as_str())
+                .into(),
+            source: row
+                .source
+                .map_or("无建议", repl_vision::SuggestionSource::zh)
+                .into(),
+            selected_index,
+        });
+    }
+    let detail = formation_report_detail(&value.report);
+    ui.set_formation_options(ModelRc::new(VecModel::from(options)));
+    ui.set_formation_rows(ModelRc::new(VecModel::from(rows)));
+    ui.set_formation_detail(detail.clone().into());
+    ui.set_formation_visible(true);
+    ui.set_status_line("编队扫描完成，请核对后确认".into());
+    detail
+}
+
+fn formation_report_detail(report: &repl_vision::FormationScanReport) -> String {
+    let recognized = report
+        .rows
+        .iter()
+        .filter(|row| row.suggestion.is_some())
+        .count();
+    let mut parts = vec![format!(
+        "识别到 {} 个槽位，其中 {} 个有姓名建议{}",
+        report.rows.len(),
+        recognized,
+        if report.used_old_layout {
+            "（旧版布局）"
+        } else {
+            ""
+        }
+    )];
+    if !report.missing_job_opers.is_empty() {
+        parts.push(format!(
+            "作业未命中：{}",
+            report.missing_job_opers.join("、")
+        ));
+    }
+    if !report.foreign_opers.is_empty() {
+        parts.push(format!(
+            "疑似非作业干员：{}",
+            report.foreign_opers.join("、")
+        ));
+    }
+    parts.join("；")
+}
+
+fn roster_fingerprint(names: &[String]) -> u64 {
+    let mut names = names.to_vec();
+    names.sort();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    names.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn validate_pending_formation(pending: &PendingFormationScan, job: &Copilot) -> anyhow::Result<()> {
+    if pending.created_at.elapsed() > FORMATION_PENDING_TTL {
+        anyhow::bail!("已超过 30 分钟有效期");
+    }
+    if pending.roster_fingerprint != roster_fingerprint(&job.oper_names()) {
+        anyhow::bail!("当前作业编队已变化");
+    }
+    let window = repl_capture::GameWindow::find()?;
+    let geometry = window.geometry()?;
+    if window.raw_handle() != pending.game_hwnd {
+        anyhow::bail!("游戏窗口已更换");
+    }
+    if geometry.width != pending.width || geometry.height != pending.height {
+        anyhow::bail!(
+            "游戏窗口尺寸从 {}×{} 变为 {}×{}",
+            pending.width,
+            pending.height,
+            geometry.width,
+            geometry.height
+        );
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn launch_run(
     ui: &MainWindow,
@@ -970,6 +1473,7 @@ fn launch_run(
     job: Copilot,
     config: Config,
     run_mode: RunMode,
+    pending_formation: Option<PendingFormationScan>,
     ruler: Arc<RulerClient>,
     cancel: Arc<AtomicBool>,
     bridge: Arc<BindingBridge>,
@@ -1009,12 +1513,14 @@ fn launch_run(
                 job,
                 config,
                 run_mode,
+                pending_formation,
                 &*ruler,
                 tx.clone(),
                 worker_cancel,
                 worker_bridge,
                 ui_window,
             ) {
+                log::error!("replication run failed: {e:#}");
                 let _ = tx.send(Progress::Failed(e.to_string()));
             }
         })
@@ -1029,6 +1535,7 @@ fn run_once(
     job: Copilot,
     config: Config,
     run_mode: RunMode,
+    pending_formation: Option<PendingFormationScan>,
     frames: &dyn FrameSource,
     events: mpsc::Sender<Progress>,
     cancel: Arc<AtomicBool>,
@@ -1037,7 +1544,7 @@ fn run_once(
 ) -> anyhow::Result<()> {
     let mut session = Session::open(&config, &job.stage_name)?;
     let mut store = BindingStore::load();
-    let wanted = match &run_mode {
+    let startup_wanted = match &run_mode {
         RunMode::FromZero => job.oper_names(),
         RunMode::Continue(plan) => {
             session.seed_battlefield(plan.battlefield.clone());
@@ -1053,166 +1560,263 @@ fn run_once(
             plan.visible_binding_names.clone()
         }
     };
+    // 全局头像档案不参与编队指纹；任何作业中出现过的部署目标都可以跨编队复用。
+    for name in job.deploy_target_names() {
+        if session.bound_names().contains(&name) {
+            continue;
+        }
+        let Some(avatar) = store.avatar(&name).cloned() else {
+            continue;
+        };
+        let restored = avatar
+            .decode()
+            .map_err(anyhow::Error::from)
+            .and_then(|bgra| session.restore_avatar(&name, avatar.width, avatar.height, &bgra));
+        match restored {
+            Ok(()) => log::info!("restored global avatar for deploy target {name}"),
+            Err(error) => log::warn!(
+                "ignored damaged global avatar for deploy target {name}; it will require deferred binding: {error}"
+            ),
+        }
+    }
     let stage = job.stage_name.clone();
+    let mut pending_formation = pending_formation;
     // binder 在工作线程里自己给 UI 发事件（卡片数据只有它知道）。
     let events_for_binder = events.clone();
 
     let binder = Box::new(
         move |session: &mut Session,
-              mode: BindingMode,
+              request: BindingRequest,
               cancel_flag: &AtomicBool|
-              -> anyhow::Result<bool> {
-            if wanted.is_empty() {
-                log::info!("no visible deployment bindings are required for this run");
-                return Ok(true);
-            }
-            let cards = session.scan_deployment()?;
-            if cards.is_empty() {
-                anyhow::bail!("识别不到部署栏，确认游戏停在战斗界面");
-            }
-            let hashes: Vec<u64> = cards
-                .iter()
-                .map(|c| perceptual_hash(&c.avatar, c.avatar_width, c.avatar_height))
-                .collect();
-            let key = fingerprint(&hashes);
-
-            // 先试着从档案恢复
-            if let Some(profile) = store.get(&key).cloned() {
-                let mut restored = 0;
-                for binding in &profile.bindings {
-                    if !wanted.contains(&binding.name) {
-                        continue;
+              -> anyhow::Result<()> {
+            match request {
+                BindingRequest::Startup { mode } => {
+                    if startup_wanted.is_empty() {
+                        log::info!("no startup deployment bindings are required for this run");
+                        return Ok(());
                     }
-                    if let Some(card) = cards.get(binding.index) {
-                        if session.bind(&binding.name, card).is_ok() {
+                    let cards = session.scan_deployment()?;
+                    if cards.is_empty() {
+                        anyhow::bail!("识别不到部署栏，确认游戏停在战斗界面");
+                    }
+                    let hashes = cards
+                        .iter()
+                        .map(|card| {
+                            perceptual_hash(&card.avatar, card.avatar_width, card.avatar_height)
+                        })
+                        .collect::<Vec<_>>();
+                    let key = fingerprint(&hashes);
+                    let mut profile = store.get(&key).cloned().unwrap_or(BindingProfile {
+                        stage_name: stage.clone(),
+                        bindings: Vec::new(),
+                    });
+                    profile.stage_name = stage.clone();
+                    let mut assignments = Vec::new();
+                    let mut already_bound = session.bound_names();
+                    for binding in profile.bindings.clone() {
+                        if !startup_wanted.contains(&binding.name)
+                            || already_bound.contains(&binding.name)
+                        {
+                            continue;
+                        }
+                        if let Some(card) = cards.iter().find(|card| card.index == binding.index) {
+                            if session.bind(&binding.name, card).is_ok() {
+                                store.remember_avatar(
+                                    &binding.name,
+                                    card.avatar_width,
+                                    card.avatar_height,
+                                    &card.avatar,
+                                );
+                                assignments.push((card.index, binding.name.clone()));
+                                already_bound.push(binding.name);
+                            }
+                        }
+                    }
+                    // 既有 Session/global/profile 绑定优先；战前扫描只解释剩余卡片。
+                    if let Some(pending) = pending_formation.take() {
+                        let still_wanted = pending
+                            .confirmed
+                            .into_iter()
+                            .filter(|(operator, _)| {
+                                startup_wanted.contains(&operator.display_name)
+                                    && !already_bound.contains(&operator.display_name)
+                            })
+                            .collect::<Vec<_>>();
+                        let candidates = session.unrecognized_cards(&cards);
+                        let bridged = repl_vision::bridge_formation_avatars(
+                            &still_wanted,
+                            &candidates,
+                            &pending.config,
+                        );
+                        for matched in bridged {
+                            let Some(card) = candidates
+                                .iter()
+                                .find(|card| card.index == matched.card_index)
+                            else {
+                                continue;
+                            };
+                            let name = matched.operator.display_name;
+                            session.bind(&name, card)?;
                             store.remember_avatar(
-                                &binding.name,
+                                &name,
                                 card.avatar_width,
                                 card.avatar_height,
                                 &card.avatar,
                             );
-                            restored += 1;
+                            profile.bindings.retain(|binding| {
+                                binding.name != name && binding.index != card.index
+                            });
+                            profile.bindings.push(binding_record(&store, &name, card));
+                            assignments.push((card.index, name.clone()));
+                            already_bound.push(name.clone());
+                            log::info!(
+                                "formation bridge bound {name} to card #{} with NCC {:.3}",
+                                card.index,
+                                matched.score
+                            );
                         }
                     }
-                }
-                if restored == wanted.len() {
-                    log::info!("restored {restored} bindings from saved profile");
-                    if let Err(e) = store.save() {
-                        log::warn!("could not update avatar archive: {e}");
+                    let bound = session.bound_names();
+                    let missing = startup_wanted
+                        .iter()
+                        .filter(|name| !bound.contains(name))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let visible_unrecognized = session.unrecognized_cards(&cards);
+                    if !startup_binding_prompt_needed(
+                        mode,
+                        missing.len(),
+                        visible_unrecognized.len(),
+                    ) {
+                        store.put(key, profile);
+                        store.save()?;
+                        if mode == BindingMode::AutomaticOnly && !visible_unrecognized.is_empty() {
+                            log::info!(
+                                "startup is running; deferred {} visible unrecognized cards and {} job names",
+                                visible_unrecognized.len(),
+                                missing.len(),
+                            );
+                        } else if !missing.is_empty() {
+                            log::info!(
+                                "startup has no unrecognized visible cards; deferred {} currently invisible job names",
+                                missing.len()
+                            );
+                        }
+                        return Ok(());
                     }
-                    return Ok(true);
-                }
-                log::info!(
-                    "saved profile only covered {restored}/{} opers; asking user",
-                    wanted.len()
-                );
-            }
 
-            // 交给 UI 让用户填。卡片数据随 NeedsBinding 事件送过去 ——
-            // UI 面板展示的一切都来自这条事件。
-            if mode == BindingMode::AutomaticOnly {
-                anyhow::bail!(
-                "焦点后的第一条样本为 running，但没有完整的编队绑定档案；为避免在运行中弹出人工绑定面板，本轮已中止"
-            );
-            }
-
-            let card_infos: Vec<repl_app::runner::BindingCardInfo> = cards
-                .iter()
-                .map(|c| repl_app::runner::BindingCardInfo {
-                    index: c.index,
-                    role: c.role.zh().to_owned(),
-                    available: c.available,
-                    cooling: c.cooling,
-                })
-                .collect();
-            *bridge.choices.lock().unwrap() = None;
-            let _ = events_for_binder.send(Progress::NeedsBinding {
-                cards: card_infos.clone(),
-                opers: wanted.clone(),
-            });
-
-            // 等用户点"确认"。填错 / 填漏不判死刑：报告缺谁、重新弹面板再来，
-            // 只有超时才放弃。
-            if let Some(window) = ui_window {
-                let activated = window.activate_once();
-                if !activated {
-                    let _ = events_for_binder.send(Progress::Log(
-                        "复刻器窗口未能自动激活，请手动切回复刻器；等待上限 15 秒".into(),
-                    ));
-                }
-                let focus_deadline = std::time::Instant::now() + Duration::from_secs(15);
-                while !window.is_foreground() && std::time::Instant::now() < focus_deadline {
-                    if cancel_flag.load(Ordering::Relaxed) {
-                        anyhow::bail!("用户中止编队绑定");
+                    bridge.reset();
+                    let _ = events_for_binder.send(Progress::NeedsBinding {
+                        cards: binding_card_infos(&visible_unrecognized),
+                        options: missing.clone(),
+                        opers: missing,
+                        assignments,
+                        allow_partial: true,
+                        title: "开局可见卡片绑定".into(),
+                        detail: "只绑定部署栏里当前实际可见的干员；尚未出现的召唤物或装置可直接留空，首次部署时会再次暂停并要求绑定。绑定期间不会发送任何游戏输入。".into(),
+                    });
+                    let choices = wait_for_binding_response(
+                        &bridge,
+                        cancel_flag,
+                        ui_window,
+                        &events_for_binder,
+                        "开局绑定",
+                        None,
+                    )?;
+                    log::info!(
+                        "startup binding confirmation received with {} visible assignments",
+                        choices.len()
+                    );
+                    let mut chosen_names = std::collections::HashSet::new();
+                    for (index, name) in choices {
+                        if !startup_wanted.contains(&name) {
+                            anyhow::bail!("绑定名称「{name}」不在当前开局编队中");
+                        }
+                        if !chosen_names.insert(name.clone()) {
+                            anyhow::bail!("开局绑定中目标「{name}」被分配给多张卡片");
+                        }
+                        let card = cards
+                            .iter()
+                            .find(|card| card.index == index)
+                            .ok_or_else(|| anyhow::anyhow!("卡片序号 {index} 不存在"))?;
+                        session.bind(&name, card)?;
+                        store.remember_avatar(
+                            &name,
+                            card.avatar_width,
+                            card.avatar_height,
+                            &card.avatar,
+                        );
+                        profile
+                            .bindings
+                            .retain(|binding| binding.name != name && binding.index != index);
+                        profile.bindings.push(binding_record(&store, &name, card));
                     }
-                    std::thread::sleep(Duration::from_millis(50));
+                    store.put(key, profile);
+                    store.save()?;
+                    log::info!("startup binding profile and global avatars saved");
+                    let _ = events_for_binder.send(Progress::BindingCommitted {
+                        message: "可见绑定已保存；请手动点击游戏窗口继续复刻".into(),
+                    });
+                    Ok(())
                 }
-                if !window.is_foreground() {
-                    anyhow::bail!("等待复刻器窗口回到前台超时，编队绑定中止");
-                }
-            }
-
-            let deadline = std::time::Instant::now() + Duration::from_secs(600);
-            loop {
-                let choices = loop {
-                    if cancel_flag.load(Ordering::Relaxed) {
-                        anyhow::bail!("用户中止编队绑定");
+                BindingRequest::Deferred { target, frame } => {
+                    if session.deploy_target_visible(&target)? {
+                        return Ok(());
                     }
-                    if let Some(c) = bridge.choices.lock().unwrap().take() {
-                        break c;
+                    let cards = session.deferred_binding_candidates(&target)?;
+                    if cards.is_empty() {
+                        anyhow::bail!(
+                            "目标召唤物或装置「{target}」尚未出现在部署栏；本轮停止且未推进帧"
+                        );
                     }
-                    if std::time::Instant::now() > deadline {
-                        anyhow::bail!("等待编队绑定超时（10 分钟）");
+                    bridge.reset();
+                    let _ = events_for_binder.send(Progress::NeedsBinding {
+                        cards: binding_card_infos(&cards),
+                        options: vec![target.clone()],
+                        opers: vec![target.clone()],
+                        assignments: Vec::new(),
+                        allow_partial: false,
+                        title: "新增召唤物绑定".into(),
+                        detail: format!(
+                            "目标「{target}」· F{frame}。游戏必须保持暂停；请从尚未被历史头像识别的卡片中选择目标。取消、游戏恢复或越过目标帧都会安全中止。"
+                        ),
+                    });
+                    let choices = wait_for_binding_response(
+                        &bridge,
+                        cancel_flag,
+                        ui_window,
+                        &events_for_binder,
+                        "延迟绑定",
+                        Some((frames, frame)),
+                    )?;
+                    let matches = choices
+                        .iter()
+                        .filter(|(_, name)| name == &target)
+                        .collect::<Vec<_>>();
+                    if matches.len() != 1 {
+                        anyhow::bail!("延迟绑定必须为「{target}」选择且只选择一张卡片");
                     }
-                    std::thread::sleep(Duration::from_millis(50));
-                };
-
-                let mut profile = store.get(&key).cloned().unwrap_or(BindingProfile {
-                    stage_name: stage.clone(),
-                    bindings: Vec::new(),
-                });
-                profile.stage_name = stage.clone();
-                for (index, name) in &choices {
+                    let index = matches[0].0;
                     let card = cards
-                        .get(*index)
+                        .iter()
+                        .find(|card| card.index == index)
                         .ok_or_else(|| anyhow::anyhow!("卡片序号 {index} 不存在"))?;
-                    session.bind(name, card)?;
+                    session.bind(&target, card)?;
                     store.remember_avatar(
-                        name,
+                        &target,
                         card.avatar_width,
                         card.avatar_height,
                         &card.avatar,
                     );
-                    profile
-                        .bindings
-                        .retain(|binding| binding.name != *name && binding.index != *index);
-                    profile.bindings.push(Binding {
-                        name: name.clone(),
-                        index: *index,
-                        role: card.role.zh().to_owned(),
-                        width: card.avatar_width,
-                        height: card.avatar_height,
-                        avatar_base64: store
-                            .avatar(name)
-                            .map_or_else(String::new, |avatar| avatar.bgra_base64.clone()),
+                    store.save()?;
+                    log::info!("deferred binding avatar for {target} saved");
+                    let _ = events_for_binder.send(Progress::BindingCommitted {
+                        message: format!(
+                            "「{target}」头像已保存；请手动点击游戏窗口继续 F{frame} 部署"
+                        ),
                     });
+                    Ok(())
                 }
-                let bound = session.bound_names();
-                let missing: Vec<_> = wanted.iter().filter(|n| !bound.contains(n)).collect();
-                if missing.is_empty() {
-                    store.put(key, profile);
-                    if let Err(e) = store.save() {
-                        log::warn!("could not save bindings: {e}");
-                    }
-                    return Ok(true);
-                }
-                let _ = events_for_binder.send(Progress::Log(format!(
-                    "这些干员还没绑定：{missing:?}。名字要和作业里写的完全一致，请补全后再点确认"
-                )));
-                let _ = events_for_binder.send(Progress::NeedsBinding {
-                    cards: card_infos.clone(),
-                    opers: wanted.clone(),
-                });
             }
         },
     );
@@ -1228,6 +1832,117 @@ fn run_once(
         binder,
     );
     runner.run()
+}
+
+fn binding_card_infos(cards: &[repl_vision::Card]) -> Vec<repl_app::runner::BindingCardInfo> {
+    cards
+        .iter()
+        .map(|card| repl_app::runner::BindingCardInfo {
+            index: card.index,
+            role: card.role.zh().to_owned(),
+            available: card.available,
+            cooling: card.cooling,
+        })
+        .collect()
+}
+
+fn startup_binding_prompt_needed(
+    mode: BindingMode,
+    missing_name_count: usize,
+    visible_unrecognized_card_count: usize,
+) -> bool {
+    mode == BindingMode::InteractiveAllowed
+        && missing_name_count > 0
+        && visible_unrecognized_card_count > 0
+}
+
+fn binding_record(store: &BindingStore, name: &str, card: &repl_vision::Card) -> Binding {
+    Binding {
+        name: name.to_owned(),
+        index: card.index,
+        role: card.role.zh().to_owned(),
+        width: card.avatar_width,
+        height: card.avatar_height,
+        avatar_base64: store
+            .avatar(name)
+            .map_or_else(String::new, |avatar| avatar.bgra_base64.clone()),
+    }
+}
+
+fn wait_for_binding_response(
+    bridge: &BindingBridge,
+    cancel: &AtomicBool,
+    ui_window: Option<UiWindowControl>,
+    events: &mpsc::Sender<Progress>,
+    context: &str,
+    deferred_guard: Option<(&dyn FrameSource, i64)>,
+) -> anyhow::Result<BindingChoices> {
+    if let Some(window) = ui_window {
+        if !window.activate_once() {
+            let _ = events.send(Progress::Log(
+                "复刻器窗口未能自动激活，请手动切回复刻器；等待上限 15 秒".into(),
+            ));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !window.is_foreground() && std::time::Instant::now() < deadline {
+            if cancel.load(Ordering::Relaxed) {
+                anyhow::bail!("用户中止{context}");
+            }
+            check_deferred_binding_guard(deferred_guard)?;
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if !window.is_foreground() {
+            anyhow::bail!("等待复刻器窗口回到前台超时，{context}中止");
+        }
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(600);
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            anyhow::bail!("用户中止{context}");
+        }
+        check_deferred_binding_guard(deferred_guard)?;
+        if let Some(response) = bridge.take() {
+            log::info!("{context} UI response received by worker");
+            return match response {
+                BindingResponse::Confirm(choices) => Ok(choices),
+                BindingResponse::Cancel => anyhow::bail!("用户取消{context}，本轮安全中止"),
+            };
+        }
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!("等待{context}超时（10 分钟）");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn check_deferred_binding_guard(guard: Option<(&dyn FrameSource, i64)>) -> anyhow::Result<()> {
+    let Some((frames, target_frame)) = guard else {
+        return Ok(());
+    };
+    let Some(snapshot) = frames.latest() else {
+        return Ok(());
+    };
+    let view = repl_app::runner::to_view(&snapshot);
+    if !view.trustworthy {
+        return Ok(());
+    }
+    if !view.in_battle {
+        anyhow::bail!("延迟绑定期间游戏离开战斗，本轮安全中止");
+    }
+    if !view.one_x {
+        anyhow::bail!("延迟绑定期间游戏不再是 1x，本轮安全中止");
+    }
+    if view.paused == Some(false) {
+        anyhow::bail!("延迟绑定期间检测到游戏恢复运行，本轮安全中止");
+    }
+    if view.elapsed != target_frame {
+        anyhow::bail!(
+            "延迟绑定期间尺子离开目标帧：目标 F{target_frame}，当前 F{}；未发送部署输入",
+            view.elapsed
+        );
+    }
+    Ok(())
 }
 
 /// 把工作线程的进度事件搬到 UI 上。
@@ -1248,7 +1963,15 @@ fn pump_progress(
                 match event {
                     Progress::Startup { phase } => {
                         ui.set_phase(phase.zh().into());
-                        ui.set_status_line(format!("启动准备：{}", phase.zh()).into());
+                        ui.set_status_line(
+                            match phase {
+                                repl_app::runner::StartupPhase::WaitingFinalFocus => {
+                                    "绑定已保存；请手动点击游戏窗口继续复刻".to_owned()
+                                }
+                                _ => format!("启动准备：{}", phase.zh()),
+                            }
+                            .into(),
+                        );
                     }
                     Progress::Phase {
                         phase,
@@ -1258,8 +1981,22 @@ fn pump_progress(
                         ui.set_phase(phase.zh().into());
                         ui.set_target_frame(target.map_or(-1, |t| t as i32));
                     }
-                    Progress::NeedsBinding { cards, opers } => {
+                    Progress::NeedsBinding {
+                        cards,
+                        options,
+                        opers,
+                        assignments,
+                        allow_partial,
+                        title,
+                        detail,
+                    } => {
                         // 面板的全部内容都从这条事件来：卡片列表、待绑定名单。
+                        let mut option_rows = vec![SharedString::from("— 当前卡片不绑定 —")];
+                        option_rows.extend(
+                            options
+                                .iter()
+                                .map(|name| SharedString::from(name.as_str())),
+                        );
                         let rows: Vec<CardRow> = cards
                             .iter()
                             .map(|c| CardRow {
@@ -1267,17 +2004,45 @@ fn pump_progress(
                                 role: c.role.as_str().into(),
                                 available: c.available,
                                 cooling: c.cooling,
-                                bound_to: SharedString::new(),
+                                bound_to: assignments
+                                    .iter()
+                                    .find(|(index, _)| *index == c.index)
+                                    .map_or_else(SharedString::new, |(_, name)| name.as_str().into()),
+                                selected_index: assignments
+                                    .iter()
+                                    .find(|(index, _)| *index == c.index)
+                                    .and_then(|(_, name)| {
+                                        options.iter().position(|option| option == name)
+                                    })
+                                    .map_or(0, |index| index.saturating_add(1) as i32),
                             })
                             .collect();
+                        ui.set_binding_options(ModelRc::new(VecModel::from(option_rows)));
                         ui.set_cards(ModelRc::new(VecModel::from(rows)));
-                        let unbound: Vec<SharedString> =
-                            opers.iter().map(|o| SharedString::from(o.as_str())).collect();
+                        let assigned_names = assignments
+                            .iter()
+                            .map(|(_, name)| name.as_str())
+                            .collect::<Vec<_>>();
+                        let unbound = opers
+                            .iter()
+                            .filter(|name| !assigned_names.contains(&name.as_str()))
+                            .map(|name| SharedString::from(name.as_str()))
+                            .collect::<Vec<_>>();
                         ui.set_unbound_opers(ModelRc::new(VecModel::from(unbound)));
                         *binding_opers.borrow_mut() = opers;
-                        pending_choices.borrow_mut().clear();
+                        *pending_choices.borrow_mut() = assignments;
+                        ui.set_binding_allow_partial(allow_partial);
+                        ui.set_binding_title(title.into());
+                        ui.set_binding_detail(detail.into());
+                        ui.set_binding_submitting(false);
                         ui.set_binding_visible(true);
-                        ui.set_status_line("请完成编队匹配".into());
+                        ui.set_status_line("游戏保持暂停：请在复刻器中完成绑定".into());
+                    }
+                    Progress::BindingCommitted { message } => {
+                        ui.set_binding_submitting(false);
+                        ui.set_binding_visible(false);
+                        ui.set_status_line(message.clone().into());
+                        append_log(&ui, &log, &message);
                     }
                     Progress::ActionStarted { index, frame } => {
                         set_row_status(&ui, index, 1);
@@ -1316,6 +2081,7 @@ fn pump_progress(
                     }
                     Progress::Failed(why) => {
                         ui.set_running(false);
+                        ui.set_binding_submitting(false);
                         ui.set_binding_visible(false);
                         ui.set_status_line(format!("中止：{why}").into());
                         append_log(&ui, &log, &format!("中止：{why}"));
@@ -1428,8 +2194,18 @@ fn refresh_editor(ui: &MainWindow, editor: &EditorState, runnable: &Rc<RefCell<O
         .iter()
         .map(|name| name.as_str().into())
         .collect();
-    let mut operator_options = vec![SharedString::from("— 选择干员 —")];
-    operator_options.extend(operators.iter().cloned());
+    let deferred_targets: Vec<SharedString> = document
+        .deferred_target_names()
+        .iter()
+        .map(|name| name.as_str().into())
+        .collect();
+    let mut operator_options = vec![SharedString::from("— 选择目标 —")];
+    operator_options.extend(
+        document
+            .target_names()
+            .iter()
+            .map(|name| SharedString::from(name.as_str())),
+    );
 
     ui.set_editor_title(document.title().into());
     ui.set_editor_stage(document.stage_name().into());
@@ -1451,11 +2227,12 @@ fn refresh_editor(ui: &MainWindow, editor: &EditorState, runnable: &Rc<RefCell<O
     ui.set_editor_actions(ModelRc::new(VecModel::from(rows)));
     ui.set_editor_diagnostics(ModelRc::new(VecModel::from(diagnostic_rows)));
     ui.set_editor_operators(ModelRc::new(VecModel::from(operators)));
+    ui.set_editor_deferred_targets(ModelRc::new(VecModel::from(deferred_targets)));
     ui.set_editor_operator_options(ModelRc::new(VecModel::from(operator_options)));
 
     if let Some(action) = editor.selected_action() {
         let operator_index = document
-            .operator_names()
+            .target_names()
             .iter()
             .position(|name| name == &action.name)
             .map_or(0, |index| {
@@ -1612,7 +2389,7 @@ fn parse_editor_direction(value: &str) -> Direction {
         "left" | "左" => Direction::Left,
         "up" | "上" => Direction::Up,
         "down" | "下" => Direction::Down,
-        "none" | "无" => Direction::None,
+        "none" | "无" | "无方向" => Direction::None,
         _ => Direction::Right,
     }
 }
@@ -1632,7 +2409,8 @@ fn direction_index(direction: Direction) -> i32 {
         Direction::Up => 0,
         Direction::Down => 1,
         Direction::Left => 2,
-        Direction::Right | Direction::None => 3,
+        Direction::Right => 3,
+        Direction::None => 4,
     }
 }
 
@@ -1821,21 +2599,77 @@ mod editor_callback_tests {
     }
 
     #[test]
-    fn editor_dropdowns_use_roster_and_four_supported_directions() {
+    fn editor_dropdowns_use_roster_and_five_supported_directions() {
         let editor_ui = include_str!("../../../ui/main.slint");
         assert!(editor_ui.contains("model: root.editor-operator-options;"));
         assert!(editor_ui.contains("model: root.editor-direction-options;"));
-        assert!(editor_ui.contains("[\"上\", \"下\", \"左\", \"右\"]"));
+        assert!(editor_ui.contains("[\"上\", \"下\", \"左\", \"右\", \"无方向\"]"));
 
         for (label, direction, index) in [
             ("上", Direction::Up, 0),
             ("下", Direction::Down, 1),
             ("左", Direction::Left, 2),
             ("右", Direction::Right, 3),
+            ("无方向", Direction::None, 4),
         ] {
             assert_eq!(parse_editor_direction(label), direction);
             assert_eq!(direction_index(direction), index);
         }
+    }
+
+    #[test]
+    fn binding_confirmation_waits_for_commit_and_uses_job_roster() {
+        let main_source = include_str!("main.rs");
+        let binding_ui = include_str!("../../../ui/main.slint");
+        let callback_start = main_source.find("ui.on_binding_confirm").unwrap();
+        let callback_end = main_source[callback_start..]
+            .find("ui.on_binding_cancel")
+            .map(|offset| callback_start + offset)
+            .unwrap();
+        let callback = &main_source[callback_start..callback_end];
+
+        assert!(
+            !callback.contains("set_binding_visible(false)"),
+            "确认只能提交响应；必须等工作线程验证并保存后再关闭绑定面板"
+        );
+        assert!(
+            binding_ui.contains("model: root.binding-options"),
+            "可见绑定必须从作业编队下拉选择，不能继续使用自由文本"
+        );
+    }
+
+    #[test]
+    fn invisible_job_names_do_not_reopen_startup_binding() {
+        assert!(!startup_binding_prompt_needed(
+            BindingMode::InteractiveAllowed,
+            8,
+            0,
+        ));
+        assert!(startup_binding_prompt_needed(
+            BindingMode::InteractiveAllowed,
+            8,
+            2,
+        ));
+        assert!(!startup_binding_prompt_needed(
+            BindingMode::AutomaticOnly,
+            8,
+            2,
+        ));
+    }
+
+    #[test]
+    fn binding_bridge_delivers_confirmation_once() {
+        let bridge = BindingBridge {
+            response: Mutex::new(None),
+        };
+        bridge.submit(BindingResponse::Confirm(vec![(3, "极境".into())]));
+        match bridge.take() {
+            Some(BindingResponse::Confirm(choices)) => {
+                assert_eq!(choices, vec![(3, "极境".into())]);
+            }
+            _ => panic!("confirmation was not delivered"),
+        }
+        assert!(bridge.take().is_none());
     }
 
     #[test]
@@ -1850,5 +2684,47 @@ mod editor_callback_tests {
         .unwrap();
 
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn formation_roster_fingerprint_is_order_independent() {
+        let left = vec!["桃金娘".to_owned(), "风笛".to_owned()];
+        let right = vec!["风笛".to_owned(), "桃金娘".to_owned()];
+        assert_eq!(roster_fingerprint(&left), roster_fingerprint(&right));
+        assert_ne!(
+            roster_fingerprint(&left),
+            roster_fingerprint(&["桃金娘".to_owned()])
+        );
+    }
+
+    #[test]
+    fn formation_ui_is_explicit_confirmable_and_generation_guarded() {
+        let main_source = include_str!("main.rs");
+        let ui_source = include_str!("../../../ui/main.slint");
+        assert!(ui_source.contains("text: formation-scanning ? \"扫描中…\" : \"扫描编队\""));
+        assert!(ui_source.contains("callback formation-confirm()"));
+        assert!(ui_source.contains("— 忽略此槽位 —"));
+        assert!(main_source.contains("result_generation != generation.load(Ordering::Relaxed)"));
+        assert!(main_source.contains("RunMode::Continue(plan),\n                None,"));
+    }
+
+    #[test]
+    fn read_only_formation_scan_helper_has_no_input_dependency() {
+        let source = include_str!("main.rs");
+        let start = source.find("fn scan_formation(").unwrap();
+        let end = source[start..]
+            .find("fn formation_image(")
+            .map(|offset| start + offset)
+            .unwrap();
+        let helper = &source[start..end];
+        for forbidden in [
+            "AfaController",
+            "Session::",
+            "dispatch(",
+            "InjectTouch",
+            "SendInput",
+        ] {
+            assert!(!helper.contains(forbidden), "scan helper used {forbidden}");
+        }
     }
 }

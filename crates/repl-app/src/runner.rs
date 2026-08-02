@@ -53,10 +53,17 @@ impl RunMode {
     }
 }
 
+/// 一次绑定请求。启动绑定允许部分完成；延迟绑定必须绑定当前 Deploy 目标。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BindingRequest {
+    Startup { mode: BindingMode },
+    Deferred { target: String, frame: i64 },
+}
+
 /// Binding callback. The cancellation flag is passed through so a waiting panel can stop
 /// promptly when the user presses Stop.
-type StartupBinder<'a> =
-    Box<dyn FnMut(&mut Session, BindingMode, &AtomicBool) -> Result<bool> + 'a>;
+type BindingHandler<'a> =
+    Box<dyn FnMut(&mut Session, BindingRequest, &AtomicBool) -> Result<()> + 'a>;
 
 /// Startup progress before the state machine receives its takeover sample.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,7 +110,18 @@ pub enum Progress {
     /// UI 的全部展示内容都来自这条事件，别的地方不维护绑定状态。
     NeedsBinding {
         cards: Vec<BindingCardInfo>,
+        /// 下拉菜单允许选择的完整作业编队/当前延迟目标。
+        options: Vec<String>,
+        /// 仍未绑定的目标，只用于状态提示与确认门禁。
         opers: Vec<String>,
+        assignments: Vec<(usize, String)>,
+        allow_partial: bool,
+        title: String,
+        detail: String,
+    },
+    /// 工作线程已验证选择并把头像档案写入磁盘；此时 UI 才能关闭绑定面板。
+    BindingCommitted {
+        message: String,
     },
     ActionStarted {
         index: usize,
@@ -155,7 +173,7 @@ pub struct Runner<'a> {
     frames: &'a dyn FrameSource,
     events: mpsc::Sender<Progress>,
     cancel: Arc<AtomicBool>,
-    binder: StartupBinder<'a>,
+    binder: BindingHandler<'a>,
 }
 
 impl<'a> Runner<'a> {
@@ -168,7 +186,7 @@ impl<'a> Runner<'a> {
         frames: &'a dyn FrameSource,
         events: mpsc::Sender<Progress>,
         cancel: Arc<AtomicBool>,
-        binder: StartupBinder<'a>,
+        binder: BindingHandler<'a>,
     ) -> Self {
         let machine = match &run_mode {
             RunMode::FromZero => Machine::new(copilot),
@@ -275,7 +293,7 @@ impl<'a> Runner<'a> {
                     // 到达目标帧后，在稳定等待期间持续读取尺子，而不是盲等后继续使用
                     // Machine 的旧游标。尺子是绝对帧的唯一真源；若它已经越过目标帧，
                     // 必须在任何鼠标或 AFA 输入发出前中止。
-                    let min_frame_id = match wait_for_action_dispatch_ready(
+                    let mut min_frame_id = match wait_for_action_dispatch_ready(
                         self.frames,
                         &self.cancel,
                         action.frame,
@@ -289,6 +307,19 @@ impl<'a> Runner<'a> {
                             return Err(error);
                         }
                     };
+                    if action.kind == ActionType::Deploy {
+                        min_frame_id = match self.ensure_deploy_binding(
+                            &action.name,
+                            action.frame,
+                            min_frame_id,
+                        ) {
+                            Ok(frame_id) => frame_id,
+                            Err(error) => {
+                                self.machine.execution_failed(error.to_string());
+                                return Err(error);
+                            }
+                        };
+                    }
                     let _ = self.events.send(Progress::ActionStarted {
                         index,
                         frame: action.frame,
@@ -334,6 +365,96 @@ impl<'a> Runner<'a> {
                     ));
                     return Ok(());
                 }
+            }
+        }
+    }
+
+    /// 在动作目标帧确认部署头像。已有档案且唯一命中时零交互通过；否则弹出
+    /// 延迟绑定，等待用户把游戏切回前台，再要求一条新的同目标帧暂停样本。
+    fn ensure_deploy_binding(
+        &mut self,
+        target: &str,
+        action_frame: i64,
+        min_frame_id: u64,
+    ) -> Result<u64> {
+        if self.session.deploy_target_visible(target)? {
+            return Ok(min_frame_id);
+        }
+
+        self.note(format!(
+            "第 {action_frame} 帧的部署目标「{target}」没有可用头像匹配，等待延迟人工绑定"
+        ));
+        (self.binder)(
+            self.session,
+            BindingRequest::Deferred {
+                target: target.to_owned(),
+                frame: action_frame,
+            },
+            &self.cancel,
+        )?;
+
+        let focus_watermark = self.latest_frame_id().max(min_frame_id);
+        self.note(format!(
+            "延迟绑定完成；请将游戏切回前台（目标 F{action_frame}，ruler watermark={focus_watermark}）"
+        ));
+        self.wait_for_game_focus()?;
+        self.session.park_cursor();
+        let frame_id = self.wait_for_action_focus_sample(focus_watermark, action_frame)?;
+        self.machine.acknowledge_frame_id(frame_id);
+
+        if !self.session.deploy_target_visible(target)? {
+            return Err(anyhow!(
+                "延迟绑定后仍无法在部署栏唯一识别「{target}」，未发送部署输入"
+            ));
+        }
+        Ok(frame_id)
+    }
+
+    fn wait_for_action_focus_sample(
+        &mut self,
+        min_frame_id: u64,
+        action_frame: i64,
+    ) -> Result<u64> {
+        let deadline = Instant::now() + POST_FOCUS_SAMPLE_TIMEOUT;
+        let mut after_frame_id = min_frame_id;
+        loop {
+            if self.cancel.load(Ordering::Relaxed) {
+                return Err(anyhow!("用户在延迟绑定焦点交接期间中止复刻"));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(anyhow!(
+                    "延迟绑定后 {} 秒内没有收到目标帧 {action_frame} 的新可信 1x_paused 样本",
+                    POST_FOCUS_SAMPLE_TIMEOUT.as_secs()
+                ));
+            }
+            match self
+                .frames
+                .wait_next(after_frame_id, remaining.min(Duration::from_millis(200)))
+            {
+                Ok(snapshot) => {
+                    let Some(frame_id) = snapshot.frame_id else {
+                        continue;
+                    };
+                    if frame_id <= after_frame_id {
+                        continue;
+                    }
+                    after_frame_id = frame_id;
+                    let view = to_view(&snapshot);
+                    match classify_action_sample(&view, action_frame) {
+                        ActionSampleDecision::Ignore => continue,
+                        ActionSampleDecision::Confirm => return Ok(frame_id),
+                        ActionSampleDecision::Reject(reason) => {
+                            return Err(anyhow!(
+                                "延迟绑定后焦点交接失败：{reason} frame_id={frame_id} state={} elapsed={}",
+                                view.battle_state,
+                                view.elapsed
+                            ));
+                        }
+                    }
+                }
+                Err(FrameError::Timeout(_)) => continue,
+                Err(error) => return Err(anyhow!("延迟绑定后读取尺子失败：{error}")),
             }
         }
     }
@@ -400,9 +521,11 @@ impl<'a> Runner<'a> {
         };
 
         self.emit_startup(StartupPhase::BindingFormation);
-        if !(self.binder)(self.session, binding_mode, &self.cancel)? {
-            return Err(anyhow!("编队绑定未完成，复刻中止"));
-        }
+        (self.binder)(
+            self.session,
+            BindingRequest::Startup { mode: binding_mode },
+            &self.cancel,
+        )?;
         self.session.park_cursor();
 
         self.emit_startup(StartupPhase::WaitingFinalFocus);

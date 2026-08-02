@@ -19,9 +19,9 @@ cargo build --release
 
 ## 架构与验证
 
-- Rust 2021 workspace；Slint 1.8 软件渲染。
+- Rust 2021 workspace；Slint `1.8` 依赖范围（当前锁定 1.17.1）软件渲染；ONNX Runtime 静态链接。
 - `repl-core`：作业、投影、状态机；`repl-frames`：尺子 WebSocket；`repl-input`：输入/AFA；
-  `repl-vision`：NCC；`repl-capture`：WGC；`repl-app`：UI 与编排。
+  `repl-vision`：NCC、MAA 兼容战前 OCR 与头像桥接；`repl-capture`：WGC；`repl-app`：UI 与编排。
 - 日志写到 exe 旁的 `replicator.log`；probe 必须走 WebSocket，HTTP 已知会被 RST。
 - 完成改造后运行 `cargo test --workspace`、`cargo clippy --workspace --all-targets -- -D warnings`、
   `cargo build --release`、`cargo fmt --all -- --check` 和 `git diff --check`。
@@ -52,9 +52,14 @@ cargo build --release
 - `PauseController` 和 `initial_gap_ms` 只保留给旧诊断/配置兼容，主复刻不得调用 Rust 直接脉冲。
 - `afa-step-test` 可调用同一 AFA `33ms` 热键做最多 500 次诊断；主复刻与诊断均以尺子证据结算。
 - NCC 前先重采样到 1280×720。`heightType` 原始值与 MAA 枚举名相反，禁止按名称修正。
+- “扫描编队”只允许截图和本地 OCR，禁止访问 AFA 或输入接口。确认结果是绑定作业/窗口/尺寸且
+  30 分钟过期的一次性 Pending，只能由下一次 FromZero 消费；继续、召唤物和装置不得复用。
+- F0 必须先恢复 Session/global/profile，再桥接剩余卡片；桥接不唯一、低于阈值、职业冲突或
+  margin 不足都回退人工绑定。扫描/确认不落库，只有 F0 桥接或人工绑定事务成功才原子保存。
 
 ## 当前状态
 
 现役快照见 `docs/CURRENT_STATE.md`，执行计划见 `.agent/PLANS.md`，首次安装验收见
 `ACCEPTANCE.md`，当前开发构建的验收只按 `docs/REAL_MACHINE_ACCEPTANCE.md`。M8 已于
 2026-07-29 通过；用户于 2026-07-30 确认当前 AFA 逐帧构建完成 M9 录像与 CSV 10/10。风险继续不得计入。
+战前 OCR/F0 桥接已本地验证，真实画面验收仍以 `docs/REAL_MACHINE_ACCEPTANCE.md` §8 为准。

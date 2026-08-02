@@ -6,12 +6,12 @@
 //! 这里不依赖窗口、尺子或输入注入。GUI 只能通过这些编辑命令改变文档，因此编辑模式
 //! 可以在没有游戏、AFA 和尺子的情况下独立工作，也不会意外创建自动化会话。
 
-use std::fs::{self, File};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use repl_core::{ActionDraft, ActionId, JobDocument};
+
+use crate::config::atomic_write;
 
 const HISTORY_LIMIT: usize = 200;
 
@@ -224,6 +224,29 @@ impl EditorState {
         true
     }
 
+    pub fn add_deferred_target(&mut self, name: impl Into<String>) {
+        let name = name.into();
+        self.edit(|document| document.add_deferred_target(name));
+    }
+
+    pub fn rename_deferred_target(&mut self, old_name: &str, new_name: &str) -> bool {
+        let before = self.snapshot();
+        if !self.document.rename_deferred_target(old_name, new_name) {
+            return false;
+        }
+        self.commit(before);
+        true
+    }
+
+    pub fn remove_deferred_target(&mut self, name: &str) -> bool {
+        let before = self.snapshot();
+        if !self.document.remove_deferred_target(name) {
+            return false;
+        }
+        self.commit(before);
+        true
+    }
+
     pub fn undo(&mut self) -> bool {
         let Some(previous) = self.undo.pop() else {
             return false;
@@ -249,7 +272,8 @@ impl EditorState {
             .or_else(|| self.path.clone())
             .context("尚未选择作业保存位置")?;
         let json = self.document.to_pretty_json().context("无法序列化作业")?;
-        atomic_write(&target, json.as_bytes())?;
+        atomic_write(&target, json.as_bytes())
+            .with_context(|| format!("无法保存作业到 {}", target.display()))?;
         self.path = Some(target.clone());
         self.saved_state_id = self.state_id;
         Ok(target)
@@ -286,60 +310,10 @@ impl EditorState {
     }
 }
 
-fn atomic_write(target: &Path, contents: &[u8]) -> Result<()> {
-    let parent = target.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).with_context(|| format!("无法创建目录 {}", parent.display()))?;
-    let file_name = target
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("job.json");
-    let temporary = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
-    let mut file = File::create(&temporary)
-        .with_context(|| format!("无法创建临时文件 {}", temporary.display()))?;
-    file.write_all(contents)
-        .with_context(|| format!("无法写入临时文件 {}", temporary.display()))?;
-    file.sync_all()
-        .with_context(|| format!("无法同步临时文件 {}", temporary.display()))?;
-    drop(file);
-
-    let replace_result = replace_file(&temporary, target);
-    if replace_result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    replace_result.with_context(|| format!("无法保存作业到 {}", target.display()))
-}
-
-#[cfg(windows)]
-fn replace_file(temporary: &Path, target: &Path) -> Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
-    use windows::core::PCWSTR;
-    use windows::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-
-    let source: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
-    let destination: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
-    // SAFETY: 两个 UTF-16 缓冲区都以 NUL 结尾，并在调用期间保持有效。
-    unsafe {
-        MoveFileExW(
-            PCWSTR(source.as_ptr()),
-            PCWSTR(destination.as_ptr()),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )?;
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn replace_file(temporary: &Path, target: &Path) -> Result<()> {
-    fs::rename(temporary, target)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn edits_undo_redo_and_dirty_state_follow_document_revisions() {

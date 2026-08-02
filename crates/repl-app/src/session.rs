@@ -174,6 +174,65 @@ impl Session {
         names
     }
 
+    /// 目标头像是否能在当前部署栏中唯一命中。
+    pub fn deploy_target_visible(&mut self, name: &str) -> Result<bool> {
+        let cards = self.scan_deployment()?;
+        let Some(avatar) = self.avatars.get(name) else {
+            return Ok(false);
+        };
+        Ok(cards
+            .iter()
+            .filter(|card| {
+                repl_vision::track(
+                    std::slice::from_ref(*card),
+                    avatar,
+                    card.tracking_threshold(),
+                )
+                .is_some()
+            })
+            .count()
+            == 1)
+    }
+
+    /// 从一次既有扫描中筛出没有被任何 Session/global/profile 头像解释的可见卡片。
+    /// 开局是否需要再次弹绑定面板只由这个集合决定，不能被尚未出现的作业名称驱动。
+    pub fn unrecognized_cards(&self, cards: &[Card]) -> Vec<Card> {
+        cards
+            .iter()
+            .filter(|card| {
+                !self.avatars.values().any(|avatar| {
+                    repl_vision::track(
+                        std::slice::from_ref(*card),
+                        avatar,
+                        card.tracking_threshold(),
+                    )
+                    .is_some()
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// 延迟绑定候选：排除被其他已知目标唯一解释的卡片，但保留当前目标历史头像
+    /// 命中的卡片，以便历史档案出现多卡歧义时让用户人工确认。
+    pub fn deferred_binding_candidates(&mut self, target: &str) -> Result<Vec<Card>> {
+        let cards = self.scan_deployment()?;
+        Ok(cards
+            .into_iter()
+            .filter(|card| {
+                !self.avatars.iter().any(|(name, avatar)| {
+                    name != target
+                        && repl_vision::track(
+                            std::slice::from_ref(card),
+                            avatar,
+                            card.tracking_threshold(),
+                        )
+                        .is_some()
+                })
+            })
+            .collect())
+    }
+
     /// 执行一个动作。`before_input` 会在准备工作完成后、首个会影响游戏的输入前调用。
     pub fn execute<F>(&mut self, action: &Action, mut before_input: F) -> Result<()>
     where

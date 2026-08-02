@@ -245,6 +245,81 @@ impl JobDocument {
         opers.len() != old_len
     }
 
+    /// 召唤物和地图装置只供动作选择，不属于开局 `opers`。
+    pub fn deferred_target_names(&self) -> Vec<String> {
+        self.root
+            .get("frame_replicator")
+            .and_then(Value::as_object)
+            .and_then(|meta| meta.get("deferred_targets"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    pub fn target_names(&self) -> Vec<String> {
+        let mut names = self.operator_names();
+        for name in self.deferred_target_names() {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        names
+    }
+
+    pub fn add_deferred_target(&mut self, name: impl Into<String>) {
+        let targets = ensure_meta_array(&mut self.root, "deferred_targets");
+        targets.push(Value::String(name.into()));
+    }
+
+    pub fn rename_deferred_target(&mut self, old_name: &str, new_name: &str) -> bool {
+        let mut renamed = false;
+        if let Some(targets) = self
+            .root
+            .get_mut("frame_replicator")
+            .and_then(Value::as_object_mut)
+            .and_then(|meta| meta.get_mut("deferred_targets"))
+            .and_then(Value::as_array_mut)
+        {
+            for target in targets {
+                if target.as_str() == Some(old_name) {
+                    *target = Value::String(new_name.to_owned());
+                    renamed = true;
+                }
+            }
+        }
+        if renamed {
+            if let Some(actions) = self.root.get_mut("actions").and_then(Value::as_array_mut) {
+                for action in actions.iter_mut().filter_map(Value::as_object_mut) {
+                    if action.get("name").and_then(Value::as_str) == Some(old_name) {
+                        action.insert("name".into(), Value::String(new_name.to_owned()));
+                    }
+                }
+            }
+        }
+        renamed
+    }
+
+    pub fn remove_deferred_target(&mut self, name: &str) -> bool {
+        if self.operator_reference_count(name) > 0 {
+            return false;
+        }
+        let Some(targets) = self
+            .root
+            .get_mut("frame_replicator")
+            .and_then(Value::as_object_mut)
+            .and_then(|meta| meta.get_mut("deferred_targets"))
+            .and_then(Value::as_array_mut)
+        else {
+            return false;
+        };
+        let old_len = targets.len();
+        targets.retain(|target| target.as_str() != Some(name));
+        targets.len() != old_len
+    }
+
     pub fn actions(&self) -> Vec<ActionDraft> {
         self.root
             .get("actions")
@@ -380,7 +455,7 @@ impl JobDocument {
             ));
         }
 
-        let declared: HashSet<String> = self.operator_names().into_iter().collect();
+        let mut declared: HashSet<String> = self.target_names().into_iter().collect();
         let actions = self.actions();
         if actions.is_empty() {
             diagnostics.push(Diagnostic::error(None, "actions", "作业里一个动作都没有"));
@@ -425,11 +500,14 @@ impl JobDocument {
             {
                 diagnostics.push(Diagnostic::error(id, "name", "动作缺少目标干员"));
             }
+            if kind == Some(ActionType::Deploy) && !action.name.is_empty() {
+                declared.insert(action.name.clone());
+            }
             if !action.name.is_empty() && !declared.is_empty() && !declared.contains(&action.name) {
                 diagnostics.push(Diagnostic::error(
                     id,
                     "name",
-                    format!("干员 `{}` 未在编队中声明", action.name),
+                    format!("目标 `{}` 未在编队或延迟目标中声明", action.name),
                 ));
             }
             match kind {
@@ -572,6 +650,27 @@ fn ensure_array<'a>(root: &'a mut Map<String, Value>, field: &str) -> &'a mut Ve
     value
         .as_array_mut()
         .expect("value was normalized to an array")
+}
+
+fn ensure_meta_array<'a>(root: &'a mut Map<String, Value>, field: &str) -> &'a mut Vec<Value> {
+    let meta = root
+        .entry("frame_replicator".to_owned())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !meta.is_object() {
+        *meta = Value::Object(Map::new());
+    }
+    let object = meta
+        .as_object_mut()
+        .expect("frame_replicator was normalized to an object");
+    let value = object
+        .entry(field.to_owned())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !value.is_array() {
+        *value = Value::Array(Vec::new());
+    }
+    value
+        .as_array_mut()
+        .expect("metadata field was normalized to an array")
 }
 
 fn string_field(root: &Map<String, Value>, field: &str) -> String {
@@ -748,6 +847,24 @@ mod tests {
             document.remove_action(id);
         }
         assert!(document.remove_operator("风笛"));
+    }
+
+    #[test]
+    fn deferred_targets_are_saved_outside_the_startup_formation() {
+        let mut document = JobDocument::parse(JOB).unwrap();
+        document.add_deferred_target("Mon3tr");
+        let mut action = document.new_action("Deploy", Some(120));
+        action.name = "Mon3tr".into();
+        action.location = Some(Point::new(4, 2));
+        document.insert_action(action);
+
+        let compiled = document.compile().unwrap();
+        assert_eq!(compiled.oper_names(), vec!["桃金娘"]);
+        assert_eq!(compiled.deferred_target_names(), vec!["Mon3tr"]);
+        assert_eq!(document.target_names(), vec!["桃金娘", "Mon3tr"]);
+        let saved: Value = serde_json::from_str(&document.to_pretty_json().unwrap()).unwrap();
+        assert_eq!(saved["frame_replicator"]["deferred_targets"][0], "Mon3tr");
+        assert_eq!(saved["opers"].as_array().unwrap().len(), 1);
     }
 
     #[test]

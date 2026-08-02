@@ -46,6 +46,9 @@ pub struct FrameReplicatorMeta {
     pub speed: String,
     #[serde(default)]
     pub after_last_action: AfterLastAction,
+    /// 编辑器可选的召唤物/地图装置名称。它们不是开局编队成员，不参与编队指纹。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred_targets: Vec<String>,
 }
 
 fn default_version() -> u32 {
@@ -62,6 +65,7 @@ impl Default for FrameReplicatorMeta {
             version: default_version(),
             speed: default_speed(),
             after_last_action: AfterLastAction::default(),
+            deferred_targets: Vec::new(),
         }
     }
 }
@@ -155,7 +159,7 @@ pub struct Action {
     /// **绝对逻辑帧** —— 帧复刻模式下唯一的等待条件。
     pub frame: i64,
     pub kind: ActionType,
-    /// 目标干员名（对应作业 `opers` 里的名字）。
+    /// 目标名称。普通干员来自 `opers`；召唤物可由 Deploy 动作首次引入。
     pub name: String,
     /// 格子坐标。`Deploy` 必填；`Skill`/`Retreat` 可以只给 name。
     pub location: Option<Point>,
@@ -291,29 +295,62 @@ impl Copilot {
             }
         }
 
-        // 动作里引用的干员必须在 opers 里声明过，否则编队绑定时无从下手。
-        if !self.opers.is_empty() {
-            for (index, action) in self.actions.iter().enumerate() {
-                if action.name.is_empty() {
-                    continue;
-                }
-                if !self.opers.iter().any(|o| o.name == action.name) {
-                    return Err(CopilotError::UndeclaredOper {
-                        index,
-                        name: action.name.clone(),
-                    });
-                }
+        // MAA 的 `opers` 只描述开局编队。召唤物可能在召唤师部署后才进入部署栏，
+        // 因此允许 Deploy 首次引入一个动作目标；后续 Skill/Retreat 才能引用它。
+        let mut known: std::collections::HashSet<&str> =
+            self.opers.iter().map(|oper| oper.name.as_str()).collect();
+        for (index, action) in self.actions.iter().enumerate() {
+            if action.name.is_empty() || known.contains(action.name.as_str()) {
+                continue;
             }
+            if action.kind == ActionType::Deploy {
+                known.insert(action.name.as_str());
+                continue;
+            }
+            return Err(CopilotError::UndeclaredOper {
+                index,
+                name: action.name.clone(),
+            });
         }
         Ok(())
     }
 
-    /// 作业中出现的全部干员名（按首次出现顺序）。
+    /// 开局编队干员名。召唤物和装置必须留在延迟目标中。
     pub fn oper_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.opers.iter().map(|o| o.name.clone()).collect();
+        self.opers.iter().map(|oper| oper.name.clone()).collect()
+    }
+
+    /// 所有可能需要从部署栏按头像识别的目标，按第一次 Deploy 的顺序去重。
+    pub fn deploy_target_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
         for action in &self.actions {
-            if !action.name.is_empty() && !names.contains(&action.name) {
+            if action.kind == ActionType::Deploy
+                && !action.name.is_empty()
+                && !names.contains(&action.name)
+            {
                 names.push(action.name.clone());
+            }
+        }
+        names
+    }
+
+    /// 不属于开局编队、由 Deploy 首次引入的召唤物或装置目标。
+    pub fn deferred_target_names(&self) -> Vec<String> {
+        let mut names = self.meta.deferred_targets.clone();
+        for name in self.deploy_target_names() {
+            if !self.opers.iter().any(|oper| oper.name == name) && !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        names
+    }
+
+    /// 编辑器动作目标下拉菜单：开局编队加延迟目标，按声明顺序去重。
+    pub fn target_names(&self) -> Vec<String> {
+        let mut names = self.oper_names();
+        for name in self.deferred_target_names() {
+            if !names.contains(&name) {
+                names.push(name);
             }
         }
         names
@@ -414,7 +451,7 @@ pub enum CopilotError {
     DeployWithoutName { index: usize },
     #[error("第 {index} 个动作 `{kind}` 既没有 `name` 也没有 `location`，不知道该对谁生效")]
     TargetlessAction { index: usize, kind: ActionType },
-    #[error("第 {index} 个动作引用了未在 `opers` 里声明的干员 `{name}`")]
+    #[error("第 {index} 个动作引用了尚未由 `opers` 或先前 Deploy 声明的目标 `{name}`")]
     UndeclaredOper { index: usize, name: String },
 }
 
@@ -583,8 +620,8 @@ mod tests {
     #[test]
     fn undeclared_opers_are_caught_before_the_run_starts() {
         let json = GOOD.replace(
-            r#""name": "史尔特尔", "location": [6, 2]"#,
-            r#""name": "陈", "location": [6, 2]"#,
+            r#""type": "Skill",   "frame": 37,  "name": "山""#,
+            r#""type": "Skill",   "frame": 37,  "name": "陈""#,
         );
         let err = Copilot::parse(&json).unwrap_err();
         let rendered = err.to_string();
@@ -592,6 +629,37 @@ mod tests {
             matches!(&err, CopilotError::UndeclaredOper { name, .. } if name == "陈"),
             "实际 {rendered}"
         );
+    }
+
+    #[test]
+    fn deploy_may_introduce_a_summon_outside_the_formation() {
+        let json = r#"{
+            "stage_name":"1-7",
+            "frame_replicator":{},
+            "opers":[{"name":"凯尔希","skill":3}],
+            "actions":[
+                {"type":"Deploy","frame":10,"name":"凯尔希","location":[3,2]},
+                {"type":"Deploy","frame":40,"name":"Mon3tr","location":[4,2]},
+                {"type":"Skill","frame":70,"name":"Mon3tr"},
+                {"type":"Retreat","frame":90,"name":"Mon3tr"}
+            ]
+        }"#;
+        let job = Copilot::parse(json).unwrap();
+        assert_eq!(job.deploy_target_names(), vec!["凯尔希", "Mon3tr"]);
+        assert_eq!(job.deferred_target_names(), vec!["Mon3tr"]);
+    }
+
+    #[test]
+    fn summon_skill_cannot_precede_its_first_deploy() {
+        let json = r#"{
+            "stage_name":"1-7",
+            "frame_replicator":{"deferred_targets":["Mon3tr"]},
+            "actions":[{"type":"Skill","frame":40,"name":"Mon3tr"}]
+        }"#;
+        assert!(matches!(
+            Copilot::parse(json).unwrap_err(),
+            CopilotError::UndeclaredOper { name, .. } if name == "Mon3tr"
+        ));
     }
 
     #[test]
@@ -616,7 +684,7 @@ mod tests {
     }
 
     #[test]
-    fn oper_names_includes_action_only_targets() {
+    fn action_only_targets_do_not_enter_the_startup_formation() {
         let json = r#"{
             "stage_name": "1-7",
             "frame_replicator": {},
@@ -626,6 +694,7 @@ mod tests {
             ]
         }"#;
         let c = Copilot::parse(json).unwrap();
-        assert_eq!(c.oper_names(), vec!["山".to_owned(), "能天使".to_owned()]);
+        assert!(c.oper_names().is_empty());
+        assert_eq!(c.deferred_target_names(), vec!["山", "能天使"]);
     }
 }

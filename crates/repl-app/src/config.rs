@@ -10,6 +10,8 @@
 
 use std::{
     collections::BTreeMap,
+    fs::{self, File},
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -71,7 +73,7 @@ impl Config {
     pub fn save(&self) -> std::io::Result<()> {
         let path = config_path(CONFIG_FILE);
         let text = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, text)
+        atomic_write(&path, text.as_bytes())
     }
 
     /// 解析出 MAA 资源目录：优先用配置里的，否则自动定位。
@@ -163,7 +165,7 @@ impl BindingStore {
 
     pub fn save(&self) -> std::io::Result<()> {
         let path = config_path(BINDINGS_FILE);
-        std::fs::write(&path, serde_json::to_string_pretty(self)?)
+        atomic_write(&path, serde_json::to_string_pretty(self)?.as_bytes())
     }
 
     pub fn get(&self, fingerprint: &str) -> Option<&BindingProfile> {
@@ -255,6 +257,60 @@ fn config_dir() -> PathBuf {
 
 fn config_path(file: &str) -> PathBuf {
     config_dir().join(file)
+}
+
+/// 同目录临时文件 + write-through 原子替换，避免异常退出留下半份 JSON。
+pub(crate) fn atomic_write(target: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let file_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("data.json");
+    let temporary = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    let result = (|| {
+        let mut file = File::create(&temporary)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        replace_file(&temporary, target)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(windows)]
+fn replace_file(temporary: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let source = temporary
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let destination = target
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    unsafe {
+        MoveFileExW(
+            PCWSTR(source.as_ptr()),
+            PCWSTR(destination.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file(temporary: &Path, target: &Path) -> std::io::Result<()> {
+    fs::rename(temporary, target)
 }
 
 #[cfg(test)]
