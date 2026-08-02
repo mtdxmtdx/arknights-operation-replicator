@@ -293,6 +293,47 @@ impl OperatorCatalog {
         self.operators.iter().find(|operator| operator.id == id)
     }
 
+    /// 按显示名称搜索 MAA 干员目录，供作业编辑器的编队添加框使用。
+    ///
+    /// 精确匹配和前缀匹配排在包含匹配之前；名称去重后按短名称、字典序稳定排序。
+    /// 这是纯本地资源查询，不触发 OCR、截图或任何游戏输入。
+    pub fn search_names(&self, query: &str, limit: usize) -> Vec<String> {
+        let needle = normalize_name(query);
+        if needle.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+
+        let mut names = self
+            .operators
+            .iter()
+            .filter_map(|operator| {
+                let name = normalize_name(&operator.display_name);
+                name.contains(&needle)
+                    .then(|| operator.display_name.clone())
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        names.sort_by(|left, right| {
+            let rank = |name: &str| {
+                let normalized = normalize_name(name);
+                if normalized == needle {
+                    0
+                } else if normalized.starts_with(&needle) {
+                    1
+                } else {
+                    2
+                }
+            };
+            rank(left)
+                .cmp(&rank(right))
+                .then_with(|| left.chars().count().cmp(&right.chars().count()))
+                .then_with(|| left.cmp(right))
+        });
+        names.truncate(limit);
+        names
+    }
+
     fn resolve(&self, raw: &str, job_names: &[String]) -> NameResolution {
         let normalized = normalize_name(raw);
         if normalized.is_empty() {
@@ -1026,6 +1067,25 @@ mod tests {
         let fuzzy = catalog.resolve("桃金粮", &job);
         assert_eq!(fuzzy.source, Some(SuggestionSource::JobFuzzy));
         assert_eq!(fuzzy.operator.unwrap().display_name, "桃金娘");
+    }
+
+    #[test]
+    fn catalog_name_search_prioritizes_prefixes_and_deduplicates() {
+        let catalog = catalog(&[
+            ("char_ansel", "安赛尔"),
+            ("char_angelina", "安洁莉娜"),
+            ("char_ambriel", "安比尔"),
+            ("char_duplicate", "安赛尔"),
+            ("char_silence", "赫默"),
+        ]);
+
+        assert_eq!(
+            catalog.search_names("安", 10),
+            vec!["安比尔", "安赛尔", "安洁莉娜"]
+        );
+        assert_eq!(catalog.search_names("赛", 10), vec!["安赛尔"]);
+        assert!(catalog.search_names("", 10).is_empty());
+        assert_eq!(catalog.search_names("安", 2).len(), 2);
     }
 
     #[test]

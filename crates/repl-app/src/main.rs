@@ -177,6 +177,7 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.set_editor_operator_options(ModelRc::new(VecModel::from(vec![SharedString::from(
         "— 选择目标 —",
     )])));
+    ui.set_editor_operator_search_results(ModelRc::new(VecModel::<SharedString>::default()));
     ui.set_editor_map_cells(ModelRc::new(VecModel::<MapCell>::default()));
     ui.set_formation_rows(ModelRc::new(VecModel::<FormationRow>::default()));
     ui.set_formation_options(ModelRc::new(VecModel::from(vec![SharedString::from(
@@ -191,6 +192,21 @@ fn main() -> Result<(), slint::PlatformError> {
     let formation_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (formation_tx, formation_rx) = mpsc::channel::<FormationScanMessage>();
     let editor = Rc::new(RefCell::new(EditorState::default()));
+    let operator_catalog = Rc::new(config.borrow().resolve_maa_resource_dir().and_then(
+        |directory| {
+            let catalog_path = directory.join("battle_data.json");
+            match repl_vision::OperatorCatalog::load(&catalog_path) {
+                Ok(catalog) => Some(catalog),
+                Err(error) => {
+                    log::warn!(
+                        "editor operator search unavailable: could not load {}: {error}",
+                        catalog_path.display()
+                    );
+                    None
+                }
+            }
+        },
+    ));
     let level_pack = Rc::new(
         config
             .borrow()
@@ -240,6 +256,49 @@ fn main() -> Result<(), slint::PlatformError> {
                 ui.set_game_found(false);
                 ui.set_battle_state("—".into());
             }
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let editor = Rc::clone(&editor);
+        let operator_catalog = Rc::clone(&operator_catalog);
+        ui.on_editor_search_operators(move |query| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let existing = editor.borrow().document().operator_names();
+            let results = operator_catalog
+                .as_ref()
+                .as_ref()
+                .map_or_else(Vec::new, |catalog| catalog.search_names(query.as_str(), 12))
+                .into_iter()
+                .filter(|name| !existing.iter().any(|operator| operator == name))
+                .map(SharedString::from)
+                .collect::<Vec<_>>();
+            ui.set_editor_operator_search_results(ModelRc::new(VecModel::from(results)));
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let editor = Rc::clone(&editor);
+        let copilot = Rc::clone(&copilot);
+        ui.on_editor_select_operator_search_result(move |name| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let name = name.trim();
+            if name.is_empty()
+                || editor
+                    .borrow()
+                    .document()
+                    .operator_names()
+                    .iter()
+                    .any(|operator| operator == name)
+            {
+                return;
+            }
+            editor.borrow_mut().add_operator(name, 1);
+            ui.set_editor_operator_query("".into());
+            ui.set_editor_operator_search_results(
+                ModelRc::new(VecModel::<SharedString>::default()),
+            );
+            refresh_editor(&ui, &editor.borrow(), &copilot);
         });
     }
     {
@@ -2637,6 +2696,20 @@ mod editor_callback_tests {
             assert_eq!(parse_editor_direction(label), direction);
             assert_eq!(direction_index(direction), index);
         }
+    }
+
+    #[test]
+    fn editor_roster_addition_exposes_local_catalog_search() {
+        let editor_ui = include_str!("../../../ui/main.slint");
+        let main_source = include_str!("main.rs");
+
+        assert!(editor_ui.contains("placeholder-text: \"搜索或手动输入干员\""));
+        assert!(editor_ui.contains("editor-operator-search-results"));
+        assert!(editor_ui.contains("callback editor-search-operators(string)"));
+        assert!(editor_ui.contains("callback editor-select-operator-search-result(string)"));
+        assert!(main_source.contains("OperatorCatalog::load(&catalog_path)"));
+        assert!(main_source.contains("catalog.search_names(query.as_str(), 12)"));
+        assert!(main_source.contains("ui.on_editor_select_operator_search_result"));
     }
 
     #[test]
