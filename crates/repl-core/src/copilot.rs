@@ -297,6 +297,8 @@ impl Copilot {
 
         // MAA 的 `opers` 只描述开局编队。召唤物可能在召唤师部署后才进入部署栏，
         // 因此允许 Deploy 首次引入一个动作目标；后续 Skill/Retreat 才能引用它。
+        // 地图装置不经历 Deploy，但 MAA 会优先按显式 location 点击，所以不要求名称
+        // 出现在编队或此前的部署记录中。
         let mut known: std::collections::HashSet<&str> =
             self.opers.iter().map(|oper| oper.name.as_str()).collect();
         for (index, action) in self.actions.iter().enumerate() {
@@ -305,6 +307,11 @@ impl Copilot {
             }
             if action.kind == ActionType::Deploy {
                 known.insert(action.name.as_str());
+                continue;
+            }
+            if matches!(action.kind, ActionType::UseSkill | ActionType::Retreat)
+                && action.location.is_some()
+            {
                 continue;
             }
             return Err(CopilotError::UndeclaredOper {
@@ -647,6 +654,32 @@ mod tests {
         let job = Copilot::parse(json).unwrap();
         assert_eq!(job.deploy_target_names(), vec!["凯尔希", "Mon3tr"]);
         assert_eq!(job.deferred_target_names(), vec!["Mon3tr"]);
+    }
+
+    #[test]
+    fn skill_with_location_can_target_a_map_device_without_deploy() {
+        let json = r#"{
+            "stage_name":"main_01-07",
+            "frame_replicator":{"version":1,"speed":"1x","deferred_targets":["留声机"]},
+            "opers":[],
+            "actions":[{"type":"Skill","frame":40,"name":"留声机","location":[5,3]}]
+        }"#;
+        let copilot = Copilot::parse(json).expect("显式格子应允许直接操作地图装置");
+        assert_eq!(copilot.actions[0].location, Some(Point::new(5, 3)));
+        assert_eq!(copilot.actions[0].name, "留声机");
+        assert!(copilot.deploy_target_names().is_empty());
+    }
+
+    #[test]
+    fn skill_with_location_does_not_require_a_name() {
+        let json = r#"{
+            "stage_name":"main_01-07",
+            "frame_replicator":{"version":1,"speed":"1x"},
+            "actions":[{"type":"Skill","frame":40,"location":[5,3]}]
+        }"#;
+        let copilot = Copilot::parse(json).expect("MAA 允许只按 location 操作技能目标");
+        assert!(copilot.actions[0].name.is_empty());
+        assert_eq!(copilot.actions[0].location, Some(Point::new(5, 3)));
     }
 
     #[test]

@@ -377,7 +377,7 @@ impl Session {
         Ok(())
     }
 
-    /// 技能动作完全交给 AFA：复刻器只把目标干员交给当前鼠标位置，再触发 AFA 热键。
+    /// 技能动作完全交给 AFA：复刻器只把目标干员或地图装置交给当前鼠标位置，再触发 AFA 热键。
     fn do_skill<F>(&mut self, action: &Action, before_input: &mut F) -> Result<()>
     where
         F: FnMut() -> Result<()>,
@@ -420,7 +420,7 @@ impl Session {
             .or_else(|| self.battlefield.get(&action.name).copied())
             .ok_or_else(|| {
                 anyhow!(
-                    "不知道干员「{}」在场上哪个格子。请在作业里给这个动作补上 location",
+                    "不知道目标「{}」在场上哪个格子。请在作业里给这个动作补上 location",
                     action.name
                 )
             })?;

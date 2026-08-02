@@ -375,6 +375,7 @@ export component MainWindow inherits Window {
     callback editor-set-metadata(string, string);
     callback editor-set-action(string, string);
     callback editor-set-location(string, string);
+    callback editor-clear-location();
     callback editor-select-map-cell(int, int);
     callback editor-add-operator(string);
     callback editor-rename-operator(string, string);
@@ -485,7 +486,7 @@ export component MainWindow inherits Window {
                             spacing: 6px;
                             Text { text: "ADD"; color: Theme.text-dim; font-size: 10px; font-weight: 700; vertical-alignment: center; }
                             Button { text: "+ 部署"; clicked => { root.editor-add-action("Deploy"); } }
-                            Button { text: "+ 技能"; clicked => { root.editor-add-action("Skill"); } }
+                            Button { text: "+ 技能 / 装置"; clicked => { root.editor-add-action("Skill"); } }
                             Button { text: "+ 撤退"; clicked => { root.editor-add-action("Retreat"); } }
                             Button { text: "+ 注释"; clicked => { root.editor-add-action("Output"); } }
                             Rectangle { }
@@ -619,7 +620,13 @@ export component MainWindow inherits Window {
                             Text { text: "类型  " + root.editor-selected-kind; color: Theme.accent; font-size: 12px; font-weight: 700; }
                             Text { text: "绝对帧"; color: Theme.text-dim; font-size: 10px; }
                             CommitLineEdit { value: root.editor-selected-frame; input-type: number; commit(value) => { root.editor-set-action("frame", value); } }
-                            Text { text: "目标干员 / 召唤物 / 装置"; color: Theme.text-dim; font-size: 10px; }
+                            Text {
+                                text: root.editor-selected-kind == "技能"
+                                    ? "目标名称（地图装置可留空，按格子定位）"
+                                    : "目标干员 / 召唤物 / 装置";
+                                color: Theme.text-dim;
+                                font-size: 10px;
+                            }
                             if root.editor-selected-kind != "注释": ComboBox {
                                 model: root.editor-operator-options;
                                 current-index <=> root.editor-selected-operator-index;
@@ -627,9 +634,15 @@ export component MainWindow inherits Window {
                                     root.editor-set-action("name", value == "— 选择目标 —" ? "" : value);
                                 }
                             }
-                            if root.editor-selected-kind == "部署": VerticalLayout {
+                            if root.editor-selected-kind == "部署" || root.editor-selected-kind == "技能": VerticalLayout {
                                 spacing: 6px;
-                                Text { text: "部署格（逻辑坐标）"; color: Theme.text-dim; font-size: 10px; }
+                                Text {
+                                    text: root.editor-selected-kind == "部署"
+                                        ? "部署格（逻辑坐标）"
+                                        : "技能目标格（地图装置必填；普通干员可留空）";
+                                    color: Theme.text-dim;
+                                    font-size: 10px;
+                                }
                                 HorizontalLayout {
                                     spacing: 5px;
                                     x-edit := CommitLineEdit {
@@ -645,11 +658,19 @@ export component MainWindow inherits Window {
                                         commit(value) => { root.editor-set-location(x-edit.text, value); }
                                     }
                                 }
-                                Text { text: "部署方向"; color: Theme.text-dim; font-size: 10px; }
-                                ComboBox {
-                                    model: root.editor-direction-options;
-                                    current-index <=> root.editor-selected-direction-index;
-                                    selected(value) => { root.editor-set-action("direction", value); }
+                                if root.editor-selected-kind == "技能": Button {
+                                    text: "清除格子（改为按名称定位）";
+                                    enabled: root.editor-selected-x != "" || root.editor-selected-y != "";
+                                    clicked => { root.editor-clear-location(); }
+                                }
+                                if root.editor-selected-kind == "部署": VerticalLayout {
+                                    spacing: 6px;
+                                    Text { text: "部署方向"; color: Theme.text-dim; font-size: 10px; }
+                                    ComboBox {
+                                        model: root.editor-direction-options;
+                                        current-index <=> root.editor-selected-direction-index;
+                                        selected(value) => { root.editor-set-action("direction", value); }
+                                    }
                                 }
                                 Rectangle {
                                     height: max(76px, min(154px, root.editor-map-height * 14px + 4px));

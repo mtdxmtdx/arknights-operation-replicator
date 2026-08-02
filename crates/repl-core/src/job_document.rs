@@ -492,13 +492,13 @@ impl JobDocument {
                     previous = frame;
                 }
             }
-            if action.name.trim().is_empty()
-                && matches!(
-                    kind,
-                    Some(ActionType::Deploy | ActionType::UseSkill | ActionType::Retreat)
-                )
+            if action.name.trim().is_empty() && kind == Some(ActionType::Deploy) {
+                diagnostics.push(Diagnostic::error(id, "name", "部署动作缺少目标名称"));
+            } else if action.name.trim().is_empty()
+                && action.location.is_none()
+                && matches!(kind, Some(ActionType::UseSkill | ActionType::Retreat))
             {
-                diagnostics.push(Diagnostic::error(id, "name", "动作缺少目标干员"));
+                diagnostics.push(Diagnostic::error(id, "target", "动作缺少目标名称或格子"));
             }
             if kind == Some(ActionType::Deploy) && !action.name.is_empty() {
                 declared.insert(action.name.clone());
@@ -524,7 +524,10 @@ impl JobDocument {
                     }
                 }
                 Some(ActionType::UseSkill) => {
-                    if !action.name.is_empty() && !deployed.contains(&action.name) {
+                    if action.location.is_none()
+                        && !action.name.is_empty()
+                        && !deployed.contains(&action.name)
+                    {
                         diagnostics.push(Diagnostic::warning(
                             id,
                             "name",
@@ -865,6 +868,43 @@ mod tests {
         let saved: Value = serde_json::from_str(&document.to_pretty_json().unwrap()).unwrap();
         assert_eq!(saved["frame_replicator"]["deferred_targets"][0], "Mon3tr");
         assert_eq!(saved["opers"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn map_device_skill_round_trips_with_an_explicit_location() {
+        let mut document = JobDocument::parse(JOB).unwrap();
+        document.add_deferred_target("留声机");
+        let mut action = document.new_action("Skill", Some(120));
+        action.name = "留声机".into();
+        action.location = Some(Point::new(5, 3));
+        document.insert_action(action);
+
+        assert!(!document.diagnostics().iter().any(|diagnostic| {
+            diagnostic.message.contains("部署记录之前使用技能")
+                || diagnostic.message.contains("未在编队或延迟目标中声明")
+        }));
+        let compiled = document.compile().expect("地图装置技能应可进入运行模型");
+        let skill = compiled.actions.last().unwrap();
+        assert_eq!(skill.kind, ActionType::UseSkill);
+        assert_eq!(skill.name, "留声机");
+        assert_eq!(skill.location, Some(Point::new(5, 3)));
+
+        let saved: Value = serde_json::from_str(&document.to_pretty_json().unwrap()).unwrap();
+        assert_eq!(
+            saved["actions"].as_array().unwrap().last().unwrap()["location"],
+            serde_json::json!([5, 3])
+        );
+    }
+
+    #[test]
+    fn location_only_skill_is_a_valid_editor_action() {
+        let mut document = JobDocument::parse(JOB).unwrap();
+        let mut action = document.new_action("Skill", Some(120));
+        action.location = Some(Point::new(5, 3));
+        document.insert_action(action);
+
+        assert!(!document.has_errors());
+        assert!(document.compile().is_ok());
     }
 
     #[test]

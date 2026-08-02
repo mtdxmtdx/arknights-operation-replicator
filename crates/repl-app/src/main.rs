@@ -403,6 +403,23 @@ fn main() -> Result<(), slint::PlatformError> {
         let ui_weak = ui.as_weak();
         let editor = Rc::clone(&editor);
         let copilot = Rc::clone(&copilot);
+        ui.on_editor_clear_location(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let Some(mut action) = editor.borrow().selected_action() else {
+                return;
+            };
+            action.location = None;
+            if let Err(error) = editor.borrow_mut().update_action(action) {
+                log::warn!("editor location clear failed: {error}");
+            }
+            refresh_editor(&ui, &editor.borrow(), &copilot);
+            set_editor_map_selection(&ui, None);
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let editor = Rc::clone(&editor);
+        let copilot = Rc::clone(&copilot);
         ui.on_editor_delete(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             editor.borrow_mut().remove_selected();
@@ -2165,6 +2182,11 @@ fn refresh_editor(ui: &MainWindow, editor: &EditorState, runnable: &Rc<RefCell<O
                 kind: kind.into(),
                 lane: if action.kind.eq_ignore_ascii_case("Output") {
                     "输出 / 注释".into()
+                } else if action.kind.eq_ignore_ascii_case("Skill")
+                    && action.name.is_empty()
+                    && action.location.is_some()
+                {
+                    "地图装置".into()
                 } else if action.name.is_empty() {
                     "未分配".into()
                 } else {
@@ -2615,6 +2637,21 @@ mod editor_callback_tests {
             assert_eq!(parse_editor_direction(label), direction);
             assert_eq!(direction_index(direction), index);
         }
+    }
+
+    #[test]
+    fn editor_exposes_map_device_skill_location_and_clear_mode() {
+        let editor_ui = include_str!("../../../ui/main.slint");
+        let main_source = include_str!("main.rs");
+
+        assert!(editor_ui.contains("+ 技能 / 装置"));
+        assert!(editor_ui.contains(
+            "root.editor-selected-kind == \"部署\" || root.editor-selected-kind == \"技能\""
+        ));
+        assert!(editor_ui.contains("技能目标格（地图装置必填；普通干员可留空）"));
+        assert!(editor_ui.contains("callback editor-clear-location()"));
+        assert!(main_source.contains("ui.on_editor_clear_location"));
+        assert!(main_source.contains("\"地图装置\".into()"));
     }
 
     #[test]

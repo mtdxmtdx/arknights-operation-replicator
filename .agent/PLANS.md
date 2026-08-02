@@ -1,5 +1,38 @@
 # 项目执行计划
 
+## 当前阶段：地图装置技能编辑（2026-08-02）
+
+### 目标与完成标准
+
+编辑器允许用 MAA 兼容的 `Skill + location` 描述关卡预置装置：技能动作可显示并点选逻辑地图，
+名称可选，显式格子优先；普通干员技能可以清除格子并恢复按部署记录定位。预置装置不得进入部署栏
+扫描、延迟绑定或头像档案。
+
+### 里程碑
+
+- [x] S0：确认 Session/AFA 运行链路已经支持显式 location，缺口只在编辑与严格校验边界。
+- [x] S1：技能属性面板开放 X/Y 和地图点选，增加清除格子入口及地图装置轨。
+- [x] S2：允许 location-only Skill，并允许未 Deploy 的命名装置凭显式 location 通过严格编译。
+- [x] S3：补充 Copilot、JobDocument、UI 回归及使用/验收文档。
+- [x] S4：运行完整自动门禁并生成新的 release 身份。
+- [ ] S5：用户按 `docs/EDITOR_ACCEPTANCE.md` E4 完成装置技能 GUI 与真实 AFA 动作验收。
+
+### 决定
+
+- 不新增私有动作类型；保存格式保持 MAA `Skill`，用 `location` 区分显式格子目标。
+- 名称只是可选标签；无名称但有格子的 Skill 合法并进入“地图装置”轨。
+- 显式 location 直接走现役 `resolve_target` 和 AFA `PauseSkill`，不扩大 Rust 输入边界。
+
+### 自动验证结果
+
+- `cargo test --workspace`：253 项通过；`repl-core` 122 项、主程序回调 12 项，新增覆盖命名装置、
+  location-only Skill、JSON 往返、无误报诊断和 UI 格子/清除模式。
+- `cargo clippy --workspace --all-targets -- -D warnings`、`cargo build --release`、
+  `cargo fmt --all -- --check`、`git diff --check`：通过。
+- `target\release\repl-app.exe`：34,337,280 字节，SHA-256
+  `29039E43D51055E58C1060ED3AE7FB529C71F042E8F16471F6500F014FEDE280`。
+- S5 的地图点选手感、真实装置技能效果和 AFA 行为仍由用户实机验收。
+
 ## 已实现、待实机验收：MAA 战前编队识别与 F0 头像桥接（2026-08-02）
 
 ### 目标与完成标准

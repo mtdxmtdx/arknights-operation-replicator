@@ -7,9 +7,9 @@
 
 | 项目 | 当前值 |
 | --- | --- |
-| 源码分支 | `develop`，本次实现与知识收尾已同步 `origin/develop` |
+| 源码分支 | 本地 `develop`，地图装置技能提交比 `origin/develop` 领先 1 个提交，尚未推送 |
 | 可执行文件 | `D:\Arknights Operation Replicator\replicator\target\release\repl-app.exe` |
-| 当前本地构建 | `34,304,512` 字节；SHA-256 `DDDF66FB6DB4ED083DD73A8B7634B9909785151B2EA7FF9601D64CDB2A78BF7F` |
+| 当前本地构建 | `34,337,280` 字节；SHA-256 `29039E43D51055E58C1060ED3AE7FB529C71F042E8F16471F6500F014FEDE280` |
 | M8 验收基线文件大小 | `14,710,272` 字节 |
 | M8 验收基线 SHA-256 | `4D510B3146FA40C95437E3E2914E7E8E42A2C91C53CFA8A8E035EEFF267AF8BD` |
 | 当前 AFA 逐帧开发构建 | `14,963,200` 字节；SHA-256 `09EEED203464B64D55F5FA53803006B7BB827EAF35648888E42D58A0D064AB6D` |

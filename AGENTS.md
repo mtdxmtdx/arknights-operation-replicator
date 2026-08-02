@@ -56,6 +56,8 @@ cargo build --release
   30 分钟过期的一次性 Pending，只能由下一次 FromZero 消费；继续、召唤物和装置不得复用。
 - F0 必须先恢复 Session/global/profile，再桥接剩余卡片；桥接不唯一、低于阈值、职业冲突或
   margin 不足都回退人工绑定。扫描/确认不落库，只有 F0 桥接或人工绑定事务成功才原子保存。
+- 地图装置技能使用 `Skill + location`，显式格子优先于名称，不要求此前 Deploy，也不进入部署栏
+  头像绑定；普通干员 Skill 可省略 location，继续按 Session 记录的部署位置定位。
 
 ## 当前状态
 
