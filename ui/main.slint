@@ -300,6 +300,7 @@ export component MainWindow inherits Window {
     in property <bool> editor-can-redo;
     in property <bool> editor-can-run;
     in property <bool> editor-follow-ruler;
+    in property <int> editor-ruler-frame: -1;
     in property <int> editor-cursor-frame;
     in property <int> editor-view-start;
     in property <[EditorActionRow]> editor-actions;
@@ -494,6 +495,21 @@ export component MainWindow inherits Window {
                             Button { text: "+ 撤退"; clicked => { root.editor-add-action("Retreat"); } }
                             Button { text: "+ 注释"; clicked => { root.editor-add-action("Output"); } }
                             Rectangle { }
+                            VerticalLayout {
+                                width: 82px;
+                                spacing: 0px;
+                                Text { text: "尺子绝对帧"; color: Theme.text-dim; font-size: 9px; horizontal-alignment: center; }
+                                Text {
+                                    text: root.ruler-connected && root.editor-ruler-frame >= 0
+                                        ? "F" + root.editor-ruler-frame
+                                        : "未连接";
+                                    color: root.ruler-connected && root.editor-ruler-frame >= 0 ? Theme.accent : Theme.text-dim;
+                                    font-size: 14px;
+                                    font-weight: 800;
+                                    horizontal-alignment: center;
+                                }
+                            }
+                            Rectangle { width: 1px; background: Theme.line; }
                             Text { text: "光标帧"; color: Theme.text-dim; font-size: 11px; vertical-alignment: center; }
                             LineEdit {
                                 width: 72px;

@@ -7,9 +7,9 @@
 
 | 项目 | 当前值 |
 | --- | --- |
-| 源码分支 | 本地 `develop`；地图装置技能 `17b07c4` 已同步到 `origin/develop`，本轮目录搜索改动尚未推送 |
+| 源码分支 | 本地 `develop`；远端仍为 `17b07c4`，目录搜索、部署后稳定屏障和编辑页实时帧尚未推送 |
 | 可执行文件 | `D:\Arknights Operation Replicator\replicator\target\release\repl-app.exe` |
-| 当前本地构建 | `34,463,232` 字节；SHA-256 `EE1B9176FEED01AEAAED8424DE7493F9F4B917CDA3B92D0A610AF51EA72B4E44` |
+| 当前本地构建 | `34,479,104` 字节；SHA-256 `9C642D0046C87C7567E3F5C12037B6833A900AD55239ED3F57D0BB203415B54A` |
 | M8 验收基线文件大小 | `14,710,272` 字节 |
 | M8 验收基线 SHA-256 | `4D510B3146FA40C95437E3E2914E7E8E42A2C91C53CFA8A8E035EEFF267AF8BD` |
 | 当前 AFA 逐帧开发构建 | `14,963,200` 字节；SHA-256 `09EEED203464B64D55F5FA53803006B7BB827EAF35648888E42D58A0D064AB6D` |
@@ -115,7 +115,10 @@ DefaultStrongHoldProtocol=0
 3. 接近目标时只允许一条 `dispatching AFA runtime pause`；收到 `runtime pause confirmed` 后才可 Pulse。
 4. Pulse 必须以 `running_then_paused` 或 `two_paused_samples` 结算；单条旧 paused 不能结算。
 5. 每个动作派发后必须出现目标帧的 `动作确认通过`；任何运行态确认样本都应立即中止。
-6. 最后动作确认后不再发送输入，UI 显示跨帧数为 0，游戏和尺子都停在最后目标帧的 `1x_paused`。
+6. 非最终 Deploy 的动作确认后必须出现同帧的 `部署后稳定确认通过`，其后才可派发 Resume 或同帧
+   下一动作；不应再出现动作完成后始终 paused、两秒后误报“没有新分析帧”的停止。
+7. Resume 真正未生效时应提示“恢复运行热键已发送，但游戏仍保持暂停”，且不得盲目重发。
+8. 最后动作确认后不再发送输入，UI 显示跨帧数为 0，游戏和尺子都停在最后目标帧的 `1x_paused`。
 
 M8 只有在下表全部通过时才完成：
 

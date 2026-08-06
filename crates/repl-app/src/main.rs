@@ -39,6 +39,9 @@ slint::include_modules!();
 type BindingChoices = Vec<(usize, String)>;
 
 const FORMATION_PENDING_TTL: Duration = Duration::from_secs(30 * 60);
+/// 编辑页的尺子帧只做共享快照读取和一个属性更新，可按约 30 FPS 刷新；
+/// AFA 探测、窗口扫描等较重状态仍保留在 400ms 定时器中。
+const EDITOR_RULER_REFRESH: Duration = Duration::from_millis(33);
 
 struct FormationDraft {
     report: repl_vision::FormationScanReport,
@@ -1272,7 +1275,38 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
 
-    // ——— 尺子状态轮询 ———
+    // ——— 编辑页实时尺子帧 ———
+    {
+        let ui_weak = ui.as_weak();
+        let ruler = Arc::clone(&ruler);
+        let timer = slint::Timer::default();
+        timer.start(
+            slint::TimerMode::Repeated,
+            EDITOR_RULER_REFRESH,
+            move || {
+                let Some(ui) = ui_weak.upgrade() else { return };
+                if !ui.get_editor_mode() {
+                    return;
+                }
+                let connected = ruler.status().is_connected();
+                ui.set_ruler_connected(connected);
+                let frame = if connected {
+                    ruler
+                        .latest()
+                        .map(|snapshot| {
+                            snapshot.total_elapsed_frames.clamp(0, i64::from(i32::MAX)) as i32
+                        })
+                        .unwrap_or(-1)
+                } else {
+                    -1
+                };
+                ui.set_editor_ruler_frame(frame);
+            },
+        );
+        std::mem::forget(timer);
+    }
+
+    // ——— 尺子与外部程序状态轮询 ———
     {
         let ui_weak = ui.as_weak();
         let ruler = Arc::clone(&ruler);
@@ -2710,6 +2744,19 @@ mod editor_callback_tests {
         assert!(main_source.contains("OperatorCatalog::load(&catalog_path)"));
         assert!(main_source.contains("catalog.search_names(query.as_str(), 12)"));
         assert!(main_source.contains("ui.on_editor_select_operator_search_result"));
+    }
+
+    #[test]
+    fn editor_shows_live_ruler_absolute_frame_without_enabling_follow_mode() {
+        let editor_ui = include_str!("../../../ui/main.slint");
+        let main_source = include_str!("main.rs");
+
+        assert!(editor_ui.contains("in property <int> editor-ruler-frame: -1;"));
+        assert!(editor_ui.contains("text: \"尺子绝对帧\""));
+        assert!(editor_ui.contains("root.editor-ruler-frame >= 0"));
+        assert!(main_source.contains("ui.set_editor_ruler_frame("));
+        assert!(main_source.contains("snapshot.total_elapsed_frames.clamp"));
+        assert!(EDITOR_RULER_REFRESH <= Duration::from_millis(34));
     }
 
     #[test]
