@@ -40,16 +40,19 @@ cargo build --release
 
 ### 0.3 告诉程序 MAA 资源目录在哪
 
-三选一：
+四选一：
+
+方式 A：启动 `repl-app.exe`，在“作业编辑”页的“MAA 资源”一行点击“选择…”。可以选择
+`resource` 本身，也可以选择它的上一级 MAA 目录；界面显示“已加载”后配置已保存。
 
 ```powershell
-# 方式 A：环境变量（当前终端会话有效，最适合跑验收工具）
+# 方式 B：环境变量（当前终端会话有效，最适合跑验收工具）
 $env:REPLICATOR_MAA_RESOURCE = 'D:\MAA\resource'
 ```
 
-方式 B：在 `repl-app.exe` 旁边的 `config.json` 里填 `"maa_resource_dir"`。
+方式 C：在 `repl-app.exe` 旁边的 `config.json` 里填 `"maa_resource_dir"`。
 
-方式 C：什么都不做 —— 程序会从当前目录逐级往上找 `MaaAssistantArknights\resource`。
+方式 D：什么都不做 —— 程序会从当前目录逐级往上找 `MaaAssistantArknights\resource`。
 你现在这个目录结构（三个项目并排）正好能命中，所以多半不用管。
 
 ### 0.4 ★必须以管理员身份运行★

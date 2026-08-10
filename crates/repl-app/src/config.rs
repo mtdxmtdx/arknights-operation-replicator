@@ -80,11 +80,7 @@ impl Config {
     pub fn resolve_maa_resource_dir(&self) -> Option<PathBuf> {
         if !self.maa_resource_dir.is_empty() {
             let dir = PathBuf::from(&self.maa_resource_dir);
-            if dir
-                .join("Arknights-Tile-Pos")
-                .join("overview.json")
-                .is_file()
-            {
+            if maa_resource_has_tile_index(&dir) {
                 return Some(dir);
             }
             log::warn!(
@@ -94,6 +90,28 @@ impl Config {
         }
         repl_vision::templates::locate_maa_resource_dir()
     }
+}
+
+/// 把用户选中的文件夹归一化为 MAA 的 `resource` 目录。
+///
+/// 文件夹选择器允许用户直接选 `resource`，也允许选它的上一级 MAA 目录；其他目录不会写入配置。
+pub fn normalize_maa_resource_dir(selection: impl AsRef<Path>) -> Result<PathBuf, String> {
+    let selection = selection.as_ref();
+    for candidate in [selection.to_path_buf(), selection.join("resource")] {
+        if maa_resource_has_tile_index(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "{} 不是可用的 MAA 目录：缺少 resource\\Arknights-Tile-Pos\\overview.json，或直接选择的目录缺少 Arknights-Tile-Pos\\overview.json",
+        selection.display()
+    ))
+}
+
+fn maa_resource_has_tile_index(dir: &Path) -> bool {
+    dir.join("Arknights-Tile-Pos")
+        .join("overview.json")
+        .is_file()
 }
 
 /// 一个干员在部署栏上的绑定档案。
@@ -410,6 +428,42 @@ mod tests {
         assert_eq!(back.initial_gap_ms, 25);
         assert!(!back.disclaimer_accepted);
         assert!(back.ruler_ws_url.contains("2606"));
+    }
+
+    #[test]
+    fn maa_resource_selection_accepts_resource_or_its_parent() {
+        let root = unique_temp_dir("maa-resource-selection");
+        let resource = root.join("resource");
+        std::fs::create_dir_all(resource.join("Arknights-Tile-Pos")).unwrap();
+        std::fs::write(
+            resource.join("Arknights-Tile-Pos").join("overview.json"),
+            "{}",
+        )
+        .unwrap();
+
+        assert_eq!(normalize_maa_resource_dir(&resource).unwrap(), resource);
+        assert_eq!(normalize_maa_resource_dir(&root).unwrap(), resource);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn maa_resource_selection_rejects_a_folder_without_tile_index() {
+        let root = unique_temp_dir("invalid-maa-resource");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let error = normalize_maa_resource_dir(&root).unwrap_err();
+        assert!(error.contains("Arknights-Tile-Pos\\overview.json"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("replicator-{label}-{}-{nonce}", std::process::id()))
     }
 
     #[test]

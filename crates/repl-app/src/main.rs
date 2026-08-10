@@ -18,7 +18,10 @@ use std::{
 };
 
 use repl_app::{
-    config::{fingerprint, perceptual_hash, Binding, BindingProfile, BindingStore, Config},
+    config::{
+        fingerprint, normalize_maa_resource_dir, perceptual_hash, Binding, BindingProfile,
+        BindingStore, Config,
+    },
     editor::EditorState,
     runner::{
         continuation_sample_ready, continuation_snapshot_plan, start_snapshot_ready, BindingMode,
@@ -195,31 +198,41 @@ fn main() -> Result<(), slint::PlatformError> {
     let formation_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (formation_tx, formation_rx) = mpsc::channel::<FormationScanMessage>();
     let editor = Rc::new(RefCell::new(EditorState::default()));
-    let operator_catalog = Rc::new(config.borrow().resolve_maa_resource_dir().and_then(
-        |directory| {
-            let catalog_path = directory.join("battle_data.json");
-            match repl_vision::OperatorCatalog::load(&catalog_path) {
-                Ok(catalog) => Some(catalog),
+    let initial_resource_dir = config.borrow().resolve_maa_resource_dir();
+    let (initial_level_pack, initial_operator_catalog, initial_resource_status) =
+        initial_resource_dir.as_ref().map_or_else(
+            || (None, None, "请选择资源目录".to_owned()),
+            |directory| match load_editor_resources(directory) {
+                Ok((level_pack, operator_catalog)) => (
+                    Some(level_pack),
+                    Some(operator_catalog),
+                    "已加载".to_owned(),
+                ),
                 Err(error) => {
                     log::warn!(
-                        "editor operator search unavailable: could not load {}: {error}",
-                        catalog_path.display()
+                        "editor resources unavailable from {}: {error}",
+                        directory.display()
                     );
-                    None
+                    (None, None, format!("加载失败：{error}"))
                 }
-            }
-        },
-    ));
-    let level_pack = Rc::new(
-        config
-            .borrow()
-            .resolve_maa_resource_dir()
-            .and_then(|directory| LevelPack::load(directory.join("Arknights-Tile-Pos")).ok()),
+            },
+        );
+    let operator_catalog = Rc::new(RefCell::new(initial_operator_catalog));
+    let level_pack = Rc::new(RefCell::new(initial_level_pack));
+    ui.set_editor_resource_path(
+        initial_resource_dir
+            .as_ref()
+            .map_or_else(
+                || "未找到 MAA resource".to_owned(),
+                |path| path.display().to_string(),
+            )
+            .into(),
     );
+    ui.set_editor_resource_status(initial_resource_status.into());
     let cancel = Arc::new(AtomicBool::new(false));
     let log = Rc::new(RefCell::new(String::new()));
     refresh_editor(&ui, &editor.borrow(), &copilot);
-    refresh_editor_map(&ui, level_pack.as_ref().as_ref(), &editor.borrow());
+    refresh_editor_map(&ui, level_pack.borrow().as_ref(), &editor.borrow());
 
     // ——— 免责声明 ———
     {
@@ -269,7 +282,61 @@ fn main() -> Result<(), slint::PlatformError> {
             let Some(ui) = ui_weak.upgrade() else { return };
             let existing = editor.borrow().document().operator_names();
             let results = operator_catalog
+                .borrow()
                 .as_ref()
+                .map_or_else(Vec::new, |catalog| catalog.search_names(query.as_str(), 12))
+                .into_iter()
+                .filter(|name| !existing.iter().any(|operator| operator == name))
+                .map(SharedString::from)
+                .collect::<Vec<_>>();
+            ui.set_editor_operator_search_results(ModelRc::new(VecModel::from(results)));
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let config = Rc::clone(&config);
+        let editor = Rc::clone(&editor);
+        let operator_catalog = Rc::clone(&operator_catalog);
+        let level_pack = Rc::clone(&level_pack);
+        ui.on_editor_select_resource(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let owner = UiWindowControl::from_ui(&ui).map(|window| window.hwnd);
+            let Some(selection) = pick_maa_resource_dir(owner).map(std::path::PathBuf::from) else {
+                return;
+            };
+            let directory = match normalize_maa_resource_dir(&selection) {
+                Ok(directory) => directory,
+                Err(error) => {
+                    ui.set_editor_resource_status(format!("选择失败：{error}").into());
+                    return;
+                }
+            };
+            let (new_level_pack, new_operator_catalog) = match load_editor_resources(&directory) {
+                Ok(resources) => resources,
+                Err(error) => {
+                    ui.set_editor_resource_status(format!("加载失败：{error}").into());
+                    return;
+                }
+            };
+
+            let previous = config.borrow().maa_resource_dir.clone();
+            config.borrow_mut().maa_resource_dir = directory.display().to_string();
+            if let Err(error) = config.borrow().save() {
+                config.borrow_mut().maa_resource_dir = previous;
+                ui.set_editor_resource_status(format!("保存失败：{error}").into());
+                return;
+            }
+
+            *level_pack.borrow_mut() = Some(new_level_pack);
+            *operator_catalog.borrow_mut() = Some(new_operator_catalog);
+            ui.set_editor_resource_path(directory.display().to_string().into());
+            ui.set_editor_resource_status("已加载".into());
+            refresh_editor_map(&ui, level_pack.borrow().as_ref(), &editor.borrow());
+
+            let existing = editor.borrow().document().operator_names();
+            let query = ui.get_editor_operator_query();
+            let results = operator_catalog
+                .borrow()
                 .as_ref()
                 .map_or_else(Vec::new, |catalog| catalog.search_names(query.as_str(), 12))
                 .into_iter()
@@ -313,7 +380,7 @@ fn main() -> Result<(), slint::PlatformError> {
             let Some(ui) = ui_weak.upgrade() else { return };
             *editor.borrow_mut() = EditorState::default();
             refresh_editor(&ui, &editor.borrow(), &copilot);
-            refresh_editor_map(&ui, level_pack.as_ref().as_ref(), &editor.borrow());
+            refresh_editor_map(&ui, level_pack.borrow().as_ref(), &editor.borrow());
         });
     }
     {
@@ -380,7 +447,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 Ok(state) => {
                     *editor.borrow_mut() = state;
                     refresh_editor(&ui, &editor.borrow(), &copilot);
-                    refresh_editor_map(&ui, level_pack.as_ref().as_ref(), &editor.borrow());
+                    refresh_editor_map(&ui, level_pack.borrow().as_ref(), &editor.borrow());
                 }
                 Err(error) => {
                     ui.set_editor_path(format!("打开失败：{error}").into());
@@ -523,7 +590,7 @@ fn main() -> Result<(), slint::PlatformError> {
             }
             refresh_editor(&ui, &editor.borrow(), &copilot);
             if field.as_str() == "stage" {
-                refresh_editor_map(&ui, level_pack.as_ref().as_ref(), &editor.borrow());
+                refresh_editor_map(&ui, level_pack.borrow().as_ref(), &editor.borrow());
             }
         });
     }
@@ -2579,6 +2646,71 @@ fn build_timeline(job: &Copilot) -> ModelRc<ActionRow> {
     ModelRc::new(VecModel::from(rows))
 }
 
+fn load_editor_resources(
+    resource_dir: &std::path::Path,
+) -> Result<(LevelPack, repl_vision::OperatorCatalog), String> {
+    let level_pack = LevelPack::load(resource_dir.join("Arknights-Tile-Pos"))
+        .map_err(|error| format!("加载关卡索引失败：{error}"))?;
+    let catalog_path = resource_dir.join("battle_data.json");
+    let operator_catalog = repl_vision::OperatorCatalog::load(&catalog_path)
+        .map_err(|error| format!("加载干员目录失败：{error}"))?;
+    Ok((level_pack, operator_catalog))
+}
+
+/// 选择 MAA 的 `resource` 目录；也允许用户选择其上一级 MAA 目录，后续统一归一化。
+#[cfg(windows)]
+fn pick_maa_resource_dir(owner: Option<isize>) -> Option<String> {
+    use windows::core::{PCWSTR, PWSTR};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Com::{
+        CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::UI::Shell::{
+        SHBrowseForFolderW, SHGetPathFromIDListW, BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS,
+        BROWSEINFOW,
+    };
+
+    let com_initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
+    let selected = (|| {
+        let mut display_name = [0u16; 260];
+        let title: Vec<u16> = "选择 MAA 的 resource 目录（也可选择 MAA 根目录）\0"
+            .encode_utf16()
+            .collect();
+        let browse = BROWSEINFOW {
+            hwndOwner: HWND(owner.unwrap_or_default() as *mut core::ffi::c_void),
+            pszDisplayName: PWSTR(display_name.as_mut_ptr()),
+            lpszTitle: PCWSTR(title.as_ptr()),
+            ulFlags: BIF_RETURNONLYFSDIRS
+                | if com_initialized {
+                    BIF_NEWDIALOGSTYLE
+                } else {
+                    0
+                },
+            ..Default::default()
+        };
+        // SAFETY: BROWSEINFOW 在调用期间持有有效缓冲区；返回的 PIDL 由 shell 分配并在下方释放。
+        let pidl = unsafe { SHBrowseForFolderW(&browse) };
+        if pidl.is_null() {
+            return None;
+        }
+        let mut path = [0u16; 260];
+        // SAFETY: path 是固定长度 MAX_PATH 缓冲区，pidl 直到 CoTaskMemFree 前保持有效。
+        let ok = unsafe { SHGetPathFromIDListW(pidl, &mut path) }.as_bool();
+        // SAFETY: pidl 来自 SHBrowseForFolderW，并且只释放一次。
+        unsafe { CoTaskMemFree(Some(pidl.cast())) };
+        if !ok {
+            return None;
+        }
+        let end = path.iter().position(|character| *character == 0)?;
+        Some(String::from_utf16_lossy(&path[..end]))
+    })();
+    if com_initialized {
+        // SAFETY: 与本函数内成功的 CoInitializeEx 成对。
+        unsafe { CoUninitialize() };
+    }
+    selected
+}
+
 /// 打开系统的"打开文件"对话框。
 ///
 /// 直接用 Win32 的 `GetOpenFileNameW`，省掉一个 GUI 依赖。
@@ -2652,6 +2784,11 @@ fn pick_job_file() -> Option<String> {
 }
 
 #[cfg(not(windows))]
+fn pick_maa_resource_dir(_owner: Option<isize>) -> Option<String> {
+    std::env::var("REPLICATOR_MAA_RESOURCE").ok()
+}
+
+#[cfg(not(windows))]
 fn pick_save_file() -> Option<String> {
     std::env::args().nth(2)
 }
@@ -2659,6 +2796,20 @@ fn pick_save_file() -> Option<String> {
 #[cfg(test)]
 mod editor_callback_tests {
     use super::*;
+
+    #[test]
+    fn editor_exposes_a_persistent_maa_resource_picker() {
+        let editor_ui = include_str!("../../../ui/main.slint");
+        let main_source = include_str!("main.rs");
+
+        assert!(editor_ui.contains("callback editor-select-resource()"));
+        assert!(editor_ui.contains("root.editor-select-resource()"));
+        assert!(editor_ui.contains("editor-resource-path"));
+        assert!(editor_ui.contains("MAA 资源"));
+        assert!(main_source.contains("on_editor_select_resource"));
+        assert!(main_source.contains("normalize_maa_resource_dir"));
+        assert!(main_source.contains("config.borrow().save()"));
+    }
 
     #[test]
     fn editor_field_tracks_the_next_selected_action_after_user_input() {

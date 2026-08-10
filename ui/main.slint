@@ -317,6 +317,8 @@ export component MainWindow inherits Window {
     in property <int> editor-map-width;
     in property <int> editor-map-height;
     in property <string> editor-map-status: "输入关卡标识以载入逻辑地图";
+    in property <string> editor-resource-path: "未找到 MAA resource";
+    in property <string> editor-resource-status: "请选择资源目录";
     in property <int> editor-selected-id: -1;
     in property <string> editor-selected-kind: "";
     in-out property <string> editor-selected-frame: "";
@@ -366,6 +368,7 @@ export component MainWindow inherits Window {
     callback editor-new();
     callback editor-open();
     callback editor-save(bool);
+    callback editor-select-resource();
     callback editor-undo();
     callback editor-redo();
     callback editor-add-action(string);
@@ -451,6 +454,34 @@ export component MainWindow inherits Window {
                         font-size: 11px;
                         vertical-alignment: center;
                     }
+                }
+            }
+            Rectangle { height: 1px; background: Theme.line; }
+            Rectangle {
+                height: 42px;
+                background: #14171c;
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    spacing: 8px;
+                    Text { text: "MAA 资源"; color: Theme.text-dim; font-size: 10px; vertical-alignment: center; }
+                    Text {
+                        horizontal-stretch: 1;
+                        text: root.editor-resource-path;
+                        color: Theme.text;
+                        font-size: 10px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    Text {
+                        width: 220px;
+                        text: root.editor-resource-status;
+                        color: root.editor-resource-status == "已加载" ? Theme.ok : Theme.warn;
+                        font-size: 10px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    Button { text: "选择…"; clicked => { root.editor-select-resource(); } }
                 }
             }
             Rectangle { height: 1px; background: Theme.line; }
