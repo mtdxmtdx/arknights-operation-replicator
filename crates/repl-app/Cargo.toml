@@ -31,6 +31,9 @@ repl-frames = { workspace = true, features = ["test-util"] }
 windows = { workspace = true, features = [
     "Win32_Globalization",
     "Win32_Storage_FileSystem",
+    "Win32_System_Com",
     "Win32_System_Console",
     "Win32_UI_Controls_Dialogs",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
 ] }

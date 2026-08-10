@@ -2,6 +2,8 @@
 
 **Arknights Operation Replicator** 是面向《明日方舟》PC 客户端的帧级作业编辑与复刻工具。
 
+当前版本：**0.2.0**。
+
 它使用 [ArknightsCostBarRuler](https://github.com/ZeroAd-06/ArknightsCostBarRuler) 提供的绝对逻辑帧
 作为唯一时间基准，并通过 [Arknights Frame Assistant](https://github.com/CloudTracey/arknights-frame-assistant) 完成暂停、恢复、逐帧、技能和撤退。
 与按费用、击杀数或技能状态推进的普通自动战斗不同，本项目只在作业指定的**绝对帧**执行动作。
@@ -80,7 +82,7 @@ M8/M9 是已经完成的历史验收基线，不能替代后来新增功能的�
 4. ArknightsCostBarRuler 已运行并完成费用条校准；复刻器通过
    `ws://127.0.0.1:2606` 读取帧状态。
 5. 可用的 MAA `resource/` 目录，用于地图投影、部署栏识别、干员目录与可选战前 OCR。
-   首次运行可在向导中指定，也可设置 `REPLICATOR_MAA_RESOURCE`。
+   可在“作业编辑”页点击“选择…”指定，也可设置 `REPLICATOR_MAA_RESOURCE`。
 
 本工具依赖费用尺，费用条无法可靠工作的关卡或状态也不适合作为复刻环境，例如费用已满、费用回复
 被锁定和剿灭作战。
@@ -96,7 +98,7 @@ cargo build --release
 
 首次启动后：
 
-1. 按向导指定 MAA 资源目录并检查尺子连接。
+1. 在“作业编辑”页选择 MAA 资源目录并检查尺子连接。
 2. 按 [完整验收手册](ACCEPTANCE.md) 验证帧源、单帧推进、地图投影和部署栏识别。
 3. 打开或创建作业，在编辑页完成打轴。
 4. 切换到“复刻执行”，按界面提示完成战前扫描、进关、焦点交接和绑定。

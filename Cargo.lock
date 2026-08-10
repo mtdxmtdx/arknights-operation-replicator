@@ -4141,7 +4141,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "repl-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -4163,7 +4163,7 @@ dependencies = [
 
 [[package]]
 name = "repl-capture"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "log",
  "repl-core",
@@ -4173,7 +4173,7 @@ dependencies = [
 
 [[package]]
 name = "repl-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "log",
  "serde",
@@ -4183,7 +4183,7 @@ dependencies = [
 
 [[package]]
 name = "repl-frames"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "log",
  "repl-core",
@@ -4195,7 +4195,7 @@ dependencies = [
 
 [[package]]
 name = "repl-input"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "log",
  "repl-core",
@@ -4206,7 +4206,7 @@ dependencies = [
 
 [[package]]
 name = "repl-vision"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "image",
  "log",
