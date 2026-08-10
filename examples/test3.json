@@ -1,0 +1,236 @@
+{
+  "actions": [
+    {
+      "direction": "Right",
+      "frame": 0,
+      "location": [
+        1,
+        3
+      ],
+      "name": "桃金娘",
+      "type": "Deploy"
+    },
+    {
+      "frame": 30,
+      "name": "桃金娘",
+      "type": "Skill"
+    },
+    {
+      "direction": "Up",
+      "frame": 118,
+      "location": [
+        2,
+        3
+      ],
+      "name": "极境",
+      "type": "Deploy"
+    },
+    {
+      "frame": 208,
+      "name": "极境",
+      "type": "Skill"
+    },
+    {
+      "direction": "Left",
+      "frame": 480,
+      "location": [
+        8,
+        4
+      ],
+      "name": "狙击小车",
+      "type": "Deploy"
+    },
+    {
+      "direction": "Right",
+      "frame": 480,
+      "location": [
+        1,
+        2
+      ],
+      "name": "望",
+      "type": "Deploy"
+    },
+    {
+      "direction": "None",
+      "frame": 480,
+      "location": [
+        5,
+        3
+      ],
+      "name": "棋子",
+      "type": "Deploy"
+    },
+    {
+      "frame": 480,
+      "name": "极境",
+      "type": "Retreat"
+    },
+    {
+      "frame": 480,
+      "name": "桃金娘",
+      "type": "Retreat"
+    },
+    {
+      "direction": "Down",
+      "frame": 480,
+      "location": [
+        8,
+        2
+      ],
+      "name": "猫车",
+      "type": "Deploy"
+    },
+    {
+      "direction": "Up",
+      "frame": 481,
+      "location": [
+        7,
+        4
+      ],
+      "name": "医疗车",
+      "type": "Deploy"
+    },
+    {
+      "direction": "Up",
+      "frame": 483,
+      "location": [
+        7,
+        2
+      ],
+      "name": "女妖车",
+      "type": "Deploy"
+    },
+    {
+      "direction": "Left",
+      "frame": 485,
+      "location": [
+        6,
+        4
+      ],
+      "name": "术士车",
+      "type": "Deploy"
+    },
+    {
+      "direction": "Up",
+      "frame": 489,
+      "location": [
+        7,
+        5
+      ],
+      "name": "自爆车",
+      "type": "Deploy"
+    },
+    {
+      "frame": 492,
+      "name": "女妖车",
+      "type": "Retreat"
+    },
+    {
+      "frame": 492,
+      "name": "狙击小车",
+      "type": "Retreat"
+    },
+    {
+      "frame": 493,
+      "name": "医疗车",
+      "type": "Retreat"
+    },
+    {
+      "frame": 493,
+      "name": "自爆车",
+      "type": "Retreat"
+    },
+    {
+      "direction": "None",
+      "frame": 542,
+      "location": [
+        2,
+        3
+      ],
+      "name": "棋子",
+      "type": "Deploy"
+    },
+    {
+      "frame": 544,
+      "location": [
+        3,
+        3
+      ],
+      "type": "Skill"
+    },
+    {
+      "direction": "Up",
+      "frame": 544,
+      "location": [
+        3,
+        2
+      ],
+      "name": "凛银",
+      "type": "Deploy"
+    }
+  ],
+  "doc": {
+    "details": "",
+    "title": "test3"
+  },
+  "frame_replicator": {
+    "after_last_action": "pause",
+    "speed": "1x",
+    "version": 1
+  },
+  "opers": [
+    {
+      "name": "桃金娘",
+      "skill": 1
+    },
+    {
+      "name": "狙击小车",
+      "skill": 1
+    },
+    {
+      "name": "猫车",
+      "skill": 1
+    },
+    {
+      "name": "医疗车",
+      "skill": 1
+    },
+    {
+      "name": "女妖车",
+      "skill": 1
+    },
+    {
+      "name": "术士车",
+      "skill": 1
+    },
+    {
+      "name": "自爆车",
+      "skill": 1
+    },
+    {
+      "name": "极境",
+      "skill": 1
+    },
+    {
+      "name": "望",
+      "skill": 1
+    },
+    {
+      "name": "棋子",
+      "skill": 1
+    },
+    {
+      "name": "风笛",
+      "skill": 1
+    },
+    {
+      "name": "76",
+      "skill": 1
+    },
+    {
+      "name": "凛银",
+      "skill": 1
+    }
+  ],
+  "stage_name": "main_01-07"
+}
