@@ -246,7 +246,9 @@ GUI、游戏输入、焦点交接和真实 OCR 仍需按实机验收文档人工
 
 项目包含从 MaaAssistantArknights（AGPL-3.0-only）和 arknights-frame-assistant
 （GPL-3.0-only）移植并改写的实现。分发程序时必须同时满足相应 copyleft 义务。逐文件来源和
-ArknightsCostBarRuler（MIT）说明见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
+ArknightsCostBarRuler（MIT）说明见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)；Windows
+Release 的锁定 Rust 运行依赖、版本和许可证表达式见
+[THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md)。
 
 ## 免责声明
 

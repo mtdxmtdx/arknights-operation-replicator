@@ -1,6 +1,6 @@
 # 当前状态
 
-更新时间：2026-08-06 09:50:14 +08:00
+更新时间：2026-08-10 12:05:34 +08:00
 
 ## 当前目标
 
@@ -76,6 +76,10 @@
   和部署四方向客户区边界回归；
   `cargo clippy --workspace --all-targets -- -D warnings`、
   `cargo build --release`、`cargo fmt --all -- --check` 和 `git diff --check`。
+- 许可证审计已区分项目自身、移植上游、Rust 运行依赖和系统组件：整体仍为 AGPL-3.0-only；
+  `THIRD-PARTY-LICENSES.md` 从锁定的 Windows x64 主程序运行图列出 342 个 crate+版本记录；Slint
+  选择 GPL-3.0-only，静态 ONNX Runtime 1.22.0 保留 MIT 义务，DirectML/VC Runtime 作为系统组件
+  不进入当前发行包。
 - 长期边界与时序决定位于 `docs/decisions/0001`–`0013`；领域术语以 `CONTEXT.md` 为准。
 
 ## 版本与发布状态

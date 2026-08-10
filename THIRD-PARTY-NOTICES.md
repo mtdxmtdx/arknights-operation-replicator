@@ -27,6 +27,50 @@ AGPL-3.0 与 GPL-3.0 的合并依据是 GPLv3 第 13 条：GPLv3 明确允许把
   向所有用户提供该修改版的源代码。
 - **不能**把本项目闭源，也不能以专有许可证再授权。
 
+## Rust 运行依赖与二进制组件
+
+主程序的 Windows x64 Release 运行依赖清单见
+[THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md)。该文件由锁定的 `Cargo.lock` 和
+`cargo tree -p repl-app --target x86_64-pc-windows-msvc --edges normal` 生成，记录实际运行图中的
+crate、版本、SPDX 许可证表达式和上游源码地址。项目自身的 AGPL-3.0-only 不会覆盖或删除这些
+第三方组件各自的版权与许可证声明。
+
+### Slint
+
+界面使用 Slint `1.17.1`。Slint 提供 GPL-3.0-only、Royalty-free 和商业许可证三种选择；本项目
+作为 AGPL-3.0-only 开源软件，明确选择 **GPL-3.0-only** 路径。发布对应源码时必须保留 Slint 及
+其子 crate 的许可证声明。
+
+### ONNX Runtime 与 `ort`
+
+战前编队 OCR 通过 `ort` / `ort-sys` `2.0.0-rc.10` 调用 ONNX Runtime `1.22.0`。Rust 封装声明为
+MIT OR Apache-2.0，本项目选择 MIT；当前 Windows Release 将 ONNX Runtime 静态链接进
+`repl-app.exe`，因此发布二进制时仍须附带 ONNX Runtime 的 MIT 许可证和第三方声明，不能因没有
+独立 `onnxruntime.dll` 而省略。
+
+### DirectML 与 Microsoft Visual C++ Runtime
+
+`repl-app.exe` 动态引用 Windows 的 `DirectML.dll` 与 Microsoft Visual C++ Runtime。它们不是本
+仓库的开源组成部分，当前发行方案也不从仓库分发这些 DLL：用户使用 Windows 系统 DirectML 和已
+安装的 VC++ 2015–2022 x64 Runtime。`target/` 下构建过程中出现的 DLL、PDB、增量文件和零字节
+占位文件均不是发行物。
+
+如果以后把 DirectML 或 VC Runtime DLL 一起打包，发布者必须另行核对并遵守 Microsoft 对对应
+版本的再分发条款，不能把它们标成 AGPL、MIT 或其他开源组件。
+
+### 二进制发布检查项
+
+每个公开二进制版本至少同时提供：
+
+1. 该二进制对应的完整源代码和构建说明；
+2. 根目录 `LICENSE`；
+3. `THIRD-PARTY-NOTICES.md` 与 `THIRD-PARTY-LICENSES.md`；
+4. 静态链接或随包分发组件要求保留的许可证全文及第三方声明；
+5. 与发布二进制一致的 `Cargo.lock`。
+
+MAA 游戏资源、AFA、ArknightsCostBarRuler、DirectML 和 VC Runtime 继续由用户独立提供时，不应
+复制进复刻器发行包。
+
 ## 逐项说明：从 MaaAssistantArknights 移植了什么
 
 上游：`MaaAssistantArknights`，AGPL-3.0-only，Copyright (C) MaaAssistantArknights 开发者。
