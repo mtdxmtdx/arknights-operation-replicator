@@ -48,6 +48,8 @@ cargo build --release
   running 样本不消耗窗口。最多允许增长 6 帧，且 `FRAME_LEAD` 必须仍保留至少 2 帧余量。
 - 运行期 AFA Resume 是等待尺子 running 回执的事务；回执前拒绝新的 paused/unknown 积压样本，
   不更新逻辑游标，也不得重发 Resume 或插入其他输入。
+- 非最终 Deploy 动作确认后必须再经过 500ms 的目标帧可信 `1x_paused` 稳定窗口，随后才允许同帧
+  下一动作或单次 Resume；窗口内出现 running、错帧、非 1x 或离战立即中止。
 - `Output`、`Finish` 和最终动作后的收尾都是零输入；`after_last_action` 只兼容解析。
 - `PauseController` 和 `initial_gap_ms` 只保留给旧诊断/配置兼容，主复刻不得调用 Rust 直接脉冲。
 - `afa-step-test` 可调用同一 AFA `33ms` 热键做最多 500 次诊断；主复刻与诊断均以尺子证据结算。
@@ -58,6 +60,8 @@ cargo build --release
   margin 不足都回退人工绑定。扫描/确认不落库，只有 F0 桥接或人工绑定事务成功才原子保存。
 - 地图装置技能使用 `Skill + location`，显式格子优先于名称，不要求此前 Deploy，也不进入部署栏
   头像绑定；普通干员 Skill 可省略 location，继续按 Session 记录的部署位置定位。
+- 编辑页实时尺子绝对帧使用独立 33ms 只读共享快照刷新；“跟随尺子”只控制时间轴光标。不得为了
+  降低显示延迟而提高 AFA 探测、游戏窗口扫描或任何输入路径的频率。
 
 ## 当前状态
 

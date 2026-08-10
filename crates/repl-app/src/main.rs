@@ -39,6 +39,9 @@ slint::include_modules!();
 type BindingChoices = Vec<(usize, String)>;
 
 const FORMATION_PENDING_TTL: Duration = Duration::from_secs(30 * 60);
+/// 编辑页的尺子帧只做共享快照读取和一个属性更新，可按约 30 FPS 刷新；
+/// AFA 探测、窗口扫描等较重状态仍保留在 400ms 定时器中。
+const EDITOR_RULER_REFRESH: Duration = Duration::from_millis(33);
 
 struct FormationDraft {
     report: repl_vision::FormationScanReport,
@@ -177,6 +180,7 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.set_editor_operator_options(ModelRc::new(VecModel::from(vec![SharedString::from(
         "— 选择目标 —",
     )])));
+    ui.set_editor_operator_search_results(ModelRc::new(VecModel::<SharedString>::default()));
     ui.set_editor_map_cells(ModelRc::new(VecModel::<MapCell>::default()));
     ui.set_formation_rows(ModelRc::new(VecModel::<FormationRow>::default()));
     ui.set_formation_options(ModelRc::new(VecModel::from(vec![SharedString::from(
@@ -191,6 +195,21 @@ fn main() -> Result<(), slint::PlatformError> {
     let formation_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (formation_tx, formation_rx) = mpsc::channel::<FormationScanMessage>();
     let editor = Rc::new(RefCell::new(EditorState::default()));
+    let operator_catalog = Rc::new(config.borrow().resolve_maa_resource_dir().and_then(
+        |directory| {
+            let catalog_path = directory.join("battle_data.json");
+            match repl_vision::OperatorCatalog::load(&catalog_path) {
+                Ok(catalog) => Some(catalog),
+                Err(error) => {
+                    log::warn!(
+                        "editor operator search unavailable: could not load {}: {error}",
+                        catalog_path.display()
+                    );
+                    None
+                }
+            }
+        },
+    ));
     let level_pack = Rc::new(
         config
             .borrow()
@@ -240,6 +259,49 @@ fn main() -> Result<(), slint::PlatformError> {
                 ui.set_game_found(false);
                 ui.set_battle_state("—".into());
             }
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let editor = Rc::clone(&editor);
+        let operator_catalog = Rc::clone(&operator_catalog);
+        ui.on_editor_search_operators(move |query| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let existing = editor.borrow().document().operator_names();
+            let results = operator_catalog
+                .as_ref()
+                .as_ref()
+                .map_or_else(Vec::new, |catalog| catalog.search_names(query.as_str(), 12))
+                .into_iter()
+                .filter(|name| !existing.iter().any(|operator| operator == name))
+                .map(SharedString::from)
+                .collect::<Vec<_>>();
+            ui.set_editor_operator_search_results(ModelRc::new(VecModel::from(results)));
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let editor = Rc::clone(&editor);
+        let copilot = Rc::clone(&copilot);
+        ui.on_editor_select_operator_search_result(move |name| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let name = name.trim();
+            if name.is_empty()
+                || editor
+                    .borrow()
+                    .document()
+                    .operator_names()
+                    .iter()
+                    .any(|operator| operator == name)
+            {
+                return;
+            }
+            editor.borrow_mut().add_operator(name, 1);
+            ui.set_editor_operator_query("".into());
+            ui.set_editor_operator_search_results(
+                ModelRc::new(VecModel::<SharedString>::default()),
+            );
+            refresh_editor(&ui, &editor.borrow(), &copilot);
         });
     }
     {
@@ -1213,7 +1275,38 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
 
-    // ——— 尺子状态轮询 ———
+    // ——— 编辑页实时尺子帧 ———
+    {
+        let ui_weak = ui.as_weak();
+        let ruler = Arc::clone(&ruler);
+        let timer = slint::Timer::default();
+        timer.start(
+            slint::TimerMode::Repeated,
+            EDITOR_RULER_REFRESH,
+            move || {
+                let Some(ui) = ui_weak.upgrade() else { return };
+                if !ui.get_editor_mode() {
+                    return;
+                }
+                let connected = ruler.status().is_connected();
+                ui.set_ruler_connected(connected);
+                let frame = if connected {
+                    ruler
+                        .latest()
+                        .map(|snapshot| {
+                            snapshot.total_elapsed_frames.clamp(0, i64::from(i32::MAX)) as i32
+                        })
+                        .unwrap_or(-1)
+                } else {
+                    -1
+                };
+                ui.set_editor_ruler_frame(frame);
+            },
+        );
+        std::mem::forget(timer);
+    }
+
+    // ——— 尺子与外部程序状态轮询 ———
     {
         let ui_weak = ui.as_weak();
         let ruler = Arc::clone(&ruler);
@@ -2637,6 +2730,33 @@ mod editor_callback_tests {
             assert_eq!(parse_editor_direction(label), direction);
             assert_eq!(direction_index(direction), index);
         }
+    }
+
+    #[test]
+    fn editor_roster_addition_exposes_local_catalog_search() {
+        let editor_ui = include_str!("../../../ui/main.slint");
+        let main_source = include_str!("main.rs");
+
+        assert!(editor_ui.contains("placeholder-text: \"搜索或手动输入干员\""));
+        assert!(editor_ui.contains("editor-operator-search-results"));
+        assert!(editor_ui.contains("callback editor-search-operators(string)"));
+        assert!(editor_ui.contains("callback editor-select-operator-search-result(string)"));
+        assert!(main_source.contains("OperatorCatalog::load(&catalog_path)"));
+        assert!(main_source.contains("catalog.search_names(query.as_str(), 12)"));
+        assert!(main_source.contains("ui.on_editor_select_operator_search_result"));
+    }
+
+    #[test]
+    fn editor_shows_live_ruler_absolute_frame_without_enabling_follow_mode() {
+        let editor_ui = include_str!("../../../ui/main.slint");
+        let main_source = include_str!("main.rs");
+
+        assert!(editor_ui.contains("in property <int> editor-ruler-frame: -1;"));
+        assert!(editor_ui.contains("text: \"尺子绝对帧\""));
+        assert!(editor_ui.contains("root.editor-ruler-frame >= 0"));
+        assert!(main_source.contains("ui.set_editor_ruler_frame("));
+        assert!(main_source.contains("snapshot.total_elapsed_frames.clamp"));
+        assert!(EDITOR_RULER_REFRESH <= Duration::from_millis(34));
     }
 
     #[test]

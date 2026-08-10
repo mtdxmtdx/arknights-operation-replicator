@@ -300,6 +300,7 @@ export component MainWindow inherits Window {
     in property <bool> editor-can-redo;
     in property <bool> editor-can-run;
     in property <bool> editor-follow-ruler;
+    in property <int> editor-ruler-frame: -1;
     in property <int> editor-cursor-frame;
     in property <int> editor-view-start;
     in property <[EditorActionRow]> editor-actions;
@@ -307,6 +308,8 @@ export component MainWindow inherits Window {
     in property <[string]> editor-operators;
     in property <[string]> editor-deferred-targets;
     in property <[string]> editor-operator-options;
+    in-out property <string> editor-operator-query: "";
+    in property <[string]> editor-operator-search-results;
     in-out property <int> editor-selected-operator-index: 0;
     in property <[string]> editor-direction-options: ["上", "下", "左", "右", "无方向"];
     in-out property <int> editor-selected-direction-index: 3;
@@ -378,6 +381,8 @@ export component MainWindow inherits Window {
     callback editor-clear-location();
     callback editor-select-map-cell(int, int);
     callback editor-add-operator(string);
+    callback editor-search-operators(string);
+    callback editor-select-operator-search-result(string);
     callback editor-rename-operator(string, string);
     callback editor-remove-operator(string);
     callback editor-add-deferred-target(string);
@@ -490,6 +495,21 @@ export component MainWindow inherits Window {
                             Button { text: "+ 撤退"; clicked => { root.editor-add-action("Retreat"); } }
                             Button { text: "+ 注释"; clicked => { root.editor-add-action("Output"); } }
                             Rectangle { }
+                            VerticalLayout {
+                                width: 82px;
+                                spacing: 0px;
+                                Text { text: "尺子绝对帧"; color: Theme.text-dim; font-size: 9px; horizontal-alignment: center; }
+                                Text {
+                                    text: root.ruler-connected && root.editor-ruler-frame >= 0
+                                        ? "F" + root.editor-ruler-frame
+                                        : "未连接";
+                                    color: root.ruler-connected && root.editor-ruler-frame >= 0 ? Theme.accent : Theme.text-dim;
+                                    font-size: 14px;
+                                    font-weight: 800;
+                                    horizontal-alignment: center;
+                                }
+                            }
+                            Rectangle { width: 1px; background: Theme.line; }
                             Text { text: "光标帧"; color: Theme.text-dim; font-size: 11px; vertical-alignment: center; }
                             LineEdit {
                                 width: 72px;
@@ -567,8 +587,40 @@ export component MainWindow inherits Window {
                         Text { text: "编队干员"; color: Theme.text-dim; font-size: 10px; }
                         HorizontalLayout {
                             spacing: 5px;
-                            new-oper := LineEdit { placeholder-text: "添加干员"; }
-                            Button { text: "+"; clicked => { root.editor-add-operator(new-oper.text); new-oper.text = ""; } }
+                            LineEdit {
+                                placeholder-text: "搜索或手动输入干员";
+                                text <=> root.editor-operator-query;
+                                edited => { root.editor-search-operators(self.text); }
+                                accepted => {
+                                    root.editor-add-operator(root.editor-operator-query);
+                                    root.editor-operator-query = "";
+                                    root.editor-search-operators("");
+                                }
+                            }
+                            Button {
+                                text: "+";
+                                clicked => {
+                                    root.editor-add-operator(root.editor-operator-query);
+                                    root.editor-operator-query = "";
+                                    root.editor-search-operators("");
+                                }
+                            }
+                        }
+                        if root.editor-operator-search-results.length > 0: Rectangle {
+                            height: min(96px, root.editor-operator-search-results.length * 24px + 4px);
+                            background: #101317;
+                            border-width: 1px;
+                            border-color: Theme.line;
+                            ScrollView {
+                                VerticalLayout {
+                                    alignment: start;
+                                    for candidate in root.editor-operator-search-results: Button {
+                                        text: candidate;
+                                        horizontal-stretch: 1;
+                                        clicked => { root.editor-select-operator-search-result(candidate); }
+                                    }
+                                }
+                            }
                         }
                         Rectangle {
                             height: min(62px, root.editor-operators.length * 24px + 4px);

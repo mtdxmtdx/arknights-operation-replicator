@@ -157,6 +157,12 @@ const PRE_ACTION_PAUSE: Duration = Duration::from_secs(1);
 /// AFA 委托或部署动作发出后，等待尺子确认动作仍停在目标帧的上限。
 const ACTION_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// 部署及朝向手势确认后，在允许下一条动作或 Resume 前保持目标帧暂停的时间。
+///
+/// 实机日志表明 150ms 的手势尾延迟后立即发送 ReleasePause 会被间歇性吞掉；500ms 与逐帧阶段
+/// 已验证的 UI 稳定窗口一致。等待期间仍持续读取尺子，绝不以盲等掩盖错帧或意外运行。
+const POST_DEPLOY_SETTLE: Duration = Duration::from_millis(500);
+
 /// AFA 自动开局暂停被尺子确认后，开始编队和后续动作前的稳定等待。
 
 /// 编队绑定面板关闭后，等待用户把游戏恢复到前台的上限。
@@ -347,6 +353,32 @@ impl<'a> Runner<'a> {
                                     self.machine.execution_failed(error.to_string());
                                     return Err(error);
                                 }
+                            }
+                            if action.kind == ActionType::Deploy
+                                && index + 1 < self.machine.copilot().actions.len()
+                            {
+                                let settle_min_frame_id = self.machine.last_frame_id();
+                                let settle_result = {
+                                    let frames = self.frames;
+                                    let machine = &mut self.machine;
+                                    wait_for_post_deploy_settle(
+                                        frames,
+                                        &self.cancel,
+                                        action.frame,
+                                        settle_min_frame_id,
+                                        POST_DEPLOY_SETTLE,
+                                        |frame_id| machine.acknowledge_frame_id(frame_id),
+                                    )
+                                };
+                                if let Err(error) = settle_result {
+                                    self.machine.execution_failed(error.to_string());
+                                    return Err(error);
+                                }
+                                self.note(format!(
+                                    "部署后稳定确认通过：frame_id={} elapsed={}",
+                                    self.machine.last_frame_id(),
+                                    action.frame
+                                ));
                             }
                             let _ = self.events.send(Progress::ActionDone { index });
                             self.machine.completed(Completion::ActionExecuted);
@@ -865,6 +897,39 @@ where
     }
 }
 
+/// 部署动作已经确认后，再保持一段完整的目标帧暂停窗口。
+///
+/// 复用动作派发前的严格分类规则：窗口内出现 running、错帧、非 1x 或离战都立即失败；只有截止
+/// 时最新样本仍是目标帧可信 `1x_paused` 才允许 Runner 进入下一条动作或发送 Resume。
+fn wait_for_post_deploy_settle<F>(
+    frames: &dyn FrameSource,
+    cancel: &AtomicBool,
+    action_frame: i64,
+    min_frame_id: u64,
+    settle: Duration,
+    on_new_sample: F,
+) -> Result<u64>
+where
+    F: FnMut(u64),
+{
+    let frame_id = wait_for_action_dispatch_ready(
+        frames,
+        cancel,
+        action_frame,
+        min_frame_id,
+        settle,
+        on_new_sample,
+    )
+    .map_err(|error| anyhow!("部署完成后稳定确认失败：{error}"))?;
+    if frame_id <= min_frame_id {
+        return Err(anyhow!(
+            "部署完成后稳定确认失败：{}ms 窗口内没有收到更新的目标帧暂停样本（min_frame_id={min_frame_id}）",
+            settle.as_millis()
+        ));
+    }
+    Ok(frame_id)
+}
+
 fn classify_action_dispatch_sample(view: &FrameView, action_frame: i64) -> Result<Option<u64>> {
     match classify_action_sample(view, action_frame) {
         ActionSampleDecision::Ignore => Ok(None),
@@ -1314,5 +1379,49 @@ mod tests {
 
         assert!(error.to_string().contains("elapsed=11"));
         assert_eq!(seen, vec![101]);
+    }
+
+    #[test]
+    fn post_deploy_settle_holds_the_target_pause_before_resume() {
+        let frames = FakeFrameSource::new([
+            snapshot_json("1x_paused", 60, 9, true),
+            snapshot_json("1x_paused", 60, 10, true),
+        ]);
+        frames
+            .wait_next(0, Duration::from_millis(1))
+            .expect("prime the post-deploy paused sample");
+
+        let cancel = AtomicBool::new(false);
+        let started = Instant::now();
+        let frame_id =
+            wait_for_post_deploy_settle(&frames, &cancel, 60, 9, Duration::from_millis(20), |_| {})
+                .expect("a stable target-frame pause should survive the deployment settle window");
+
+        assert_eq!(frame_id, 10);
+        assert!(started.elapsed() >= Duration::from_millis(15));
+    }
+
+    #[test]
+    fn post_deploy_settle_rejects_running_before_resume() {
+        let frames = FakeFrameSource::new([
+            snapshot_json("1x_paused", 60, 9, true),
+            snapshot_json("1x_running", 60, 10, true),
+        ]);
+        frames
+            .wait_next(0, Duration::from_millis(1))
+            .expect("prime the post-deploy paused sample");
+
+        let error = wait_for_post_deploy_settle(
+            &frames,
+            &AtomicBool::new(false),
+            60,
+            9,
+            Duration::from_millis(20),
+            |_| {},
+        )
+        .expect_err("deployment settle must fail closed if the game starts running");
+
+        assert!(error.to_string().contains("部署完成后"));
+        assert!(error.to_string().contains("观察到运行态"));
     }
 }

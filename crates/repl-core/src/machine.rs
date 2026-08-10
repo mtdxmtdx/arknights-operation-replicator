@@ -140,6 +140,8 @@ pub enum AbortReason {
     OvershotTarget { target: i64, actual: i64 },
     /// 等不到新的分析帧。
     FrameTimeout,
+    /// 恢复运行热键已发出，但尺子始终没有确认 running。
+    ResumeIneffective,
     /// 暂停键没生效（多半是代理指挥 / 托管）。
     PauseIneffective,
     /// 脉冲已经发出，但尺子长时间没有看到它回到暂停态。
@@ -185,6 +187,11 @@ impl std::fmt::Display for AbortReason {
                  ② 尺子是否还在运行、是否已校准；\
                  ③ 费用满 / 费用回复被锁 / 剿灭作战都会让尺子停止计帧。\
                  详细诊断见日志面板和 replicator.log"
+            ),
+            Self::ResumeIneffective => write!(
+                f,
+                "恢复运行热键已发送，但游戏仍保持暂停。为避免重复 ReleasePause 扰乱 AFA 状态，\
+                 本轮已中止；请检查 AFA ReleasePause 热键是否生效。详细诊断见 replicator.log"
             ),
             Self::PauseIneffective => write!(
                 f,
@@ -796,7 +803,12 @@ impl Machine {
 
     /// 等帧超时。
     pub fn frame_timeout(&mut self) {
-        self.fail(AbortReason::FrameTimeout);
+        let reason = if self.resume_in_flight {
+            AbortReason::ResumeIneffective
+        } else {
+            AbortReason::FrameTimeout
+        };
+        self.fail(reason);
     }
 }
 
@@ -1417,6 +1429,24 @@ mod tests {
         ));
         // 中止后不再接受任何样本
         assert!(!m.observe(&view(99, 100, true)));
+    }
+
+    #[test]
+    fn resume_ack_timeout_reports_resume_ineffective() {
+        let mut m = machine_at_zero();
+        m.completed(Completion::ActionExecuted);
+        assert_eq!(m.next_command(), Command::Resume);
+        m.completed(Completion::ResumeSent);
+
+        m.frame_timeout();
+
+        let Command::Abort(reason) = m.next_command() else {
+            panic!("resume acknowledgement timeout must abort");
+        };
+        assert_eq!(reason, AbortReason::ResumeIneffective);
+        assert!(reason
+            .to_string()
+            .contains("恢复运行热键已发送，但游戏仍保持暂停"));
     }
 
     #[test]
