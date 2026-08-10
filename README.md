@@ -3,7 +3,7 @@
 **Arknights Operation Replicator** 是面向《明日方舟》PC 客户端的帧级作业编辑与复刻工具。
 
 它使用 [ArknightsCostBarRuler](https://github.com/ZeroAd-06/ArknightsCostBarRuler) 提供的绝对逻辑帧
-作为唯一时间基准，并通过 AFA（Arknights Frame Assistant）完成暂停、恢复、逐帧、技能和撤退。
+作为唯一时间基准，并通过 [Arknights Frame Assistant](https://github.com/CloudTracey/arknights-frame-assistant) 完成暂停、恢复、逐帧、技能和撤退。
 与按费用、击杀数或技能状态推进的普通自动战斗不同，本项目只在作业指定的**绝对帧**执行动作。
 
 ```text
