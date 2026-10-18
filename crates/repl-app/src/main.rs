@@ -730,9 +730,9 @@ fn main() -> Result<(), slint::PlatformError> {
             let Ok(frame) = value.parse::<i64>() else {
                 return;
             };
+            // 视图起点由 UI 自行管理（横向滚动 / 光标越界时翻页），这里只同步光标。
             editor.borrow_mut().set_cursor_frame(frame);
-            ui.set_editor_cursor_frame(frame.min(i32::MAX as i64) as i32);
-            ui.set_editor_view_start(frame.saturating_sub(30).min(i32::MAX as i64) as i32);
+            ui.set_editor_cursor_frame(editor.borrow().cursor_frame().min(i32::MAX as i64) as i32);
         });
     }
 
@@ -1409,7 +1409,6 @@ fn main() -> Result<(), slint::PlatformError> {
                                 snapshot.total_elapsed_frames.clamp(0, i64::from(i32::MAX)) as i32;
                             editor.borrow_mut().set_cursor_frame(i64::from(frame));
                             ui.set_editor_cursor_frame(frame);
-                            ui.set_editor_view_start(frame.saturating_sub(30));
                         }
                     }
                     return;
@@ -2405,7 +2404,8 @@ fn refresh_editor(ui: &MainWindow, editor: &EditorState, runnable: &Rc<RefCell<O
         .cursor_frame()
         .clamp(i32::MIN as i64, i32::MAX as i64) as i32;
     ui.set_editor_cursor_frame(cursor);
-    ui.set_editor_view_start(cursor.saturating_sub(30));
+    // 时间轴滚动范围需要最后一个动作帧；不能假设动作已按帧排序。
+    ui.set_editor_last_frame(rows.iter().map(|row| row.frame).max().unwrap_or(0));
     ui.set_editor_actions(ModelRc::new(VecModel::from(rows)));
     ui.set_editor_diagnostics(ModelRc::new(VecModel::from(diagnostic_rows)));
     ui.set_editor_operators(ModelRc::new(VecModel::from(operators)));
@@ -2903,7 +2903,7 @@ mod editor_callback_tests {
         let main_source = include_str!("main.rs");
 
         assert!(editor_ui.contains("in property <int> editor-ruler-frame: -1;"));
-        assert!(editor_ui.contains("text: \"尺子绝对帧\""));
+        assert!(editor_ui.contains("Text { text: \"尺子\";"));
         assert!(editor_ui.contains("root.editor-ruler-frame >= 0"));
         assert!(main_source.contains("ui.set_editor_ruler_frame("));
         assert!(main_source.contains("snapshot.total_elapsed_frames.clamp"));
@@ -3009,7 +3009,7 @@ mod editor_callback_tests {
     fn formation_ui_is_explicit_confirmable_and_generation_guarded() {
         let main_source = include_str!("main.rs");
         let ui_source = include_str!("../../../ui/main.slint");
-        assert!(ui_source.contains("text: formation-scanning ? \"扫描中…\" : \"扫描编队\""));
+        assert!(ui_source.contains("text: root.formation-scanning ? \"扫描中…\" : \"扫描编队\""));
         assert!(ui_source.contains("callback formation-confirm()"));
         assert!(ui_source.contains("— 忽略此槽位 —"));
         assert!(main_source.contains("result_generation != generation.load(Ordering::Relaxed)"));

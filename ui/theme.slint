@@ -5,22 +5,73 @@
 
 export global Theme {
     out property <brush> bg: #14161a;
+    out property <brush> chrome: #0f1114;
+    out property <brush> surface: #181b20;
     out property <brush> panel: #1c2026;
     out property <brush> panel-alt: #232830;
+    out property <brush> well: #101317;
     out property <brush> line: #2e343d;
+    out property <brush> line-soft: #252a32;
 
     out property <brush> text: #e6e9ee;
     out property <brush> text-dim: #8b939f;
+    out property <brush> text-faint: #5d6570;
 
     out property <brush> accent: #ffd54a;
+    out property <brush> accent-soft: #ffd54a33;
     out property <brush> ok: #5ec26a;
+    out property <brush> ok-bg: #1d3a28;
     out property <brush> warn: #f0a020;
     out property <brush> error: #e05252;
+    out property <brush> error-bg: #3d2226;
     out property <brush> idle: #4a515c;
+
+    // 时间轴动作块配色：按动作类型区分，严重度优先。
+    out property <brush> kind-deploy: #234b4d;
+    out property <brush> kind-skill: #43375b;
+    out property <brush> kind-retreat: #543238;
+    out property <brush> kind-output: #303640;
+    out property <brush> sev-warn: #554421;
+    out property <brush> sev-error: #5a292d;
 
     out property <length> gap: 8px;
     out property <length> pad: 12px;
     out property <length> radius: 4px;
+
+    out property <length> font-xs: 10px;
+    out property <length> font-sm: 11px;
+    out property <length> font-md: 12px;
+    out property <length> font-lg: 14px;
+}
+
+/// 分区小标题：大写英文 + 中文说明，统一面板层级。
+export component SectionTitle inherits HorizontalLayout {
+    in property <string> text;
+    in property <string> hint;
+    spacing: 8px;
+    Text {
+        text: root.text;
+        color: Theme.text;
+        font-size: Theme.font-sm;
+        font-weight: 800;
+        letter-spacing: 0.6px;
+        vertical-alignment: center;
+    }
+    Text {
+        text: root.hint;
+        color: Theme.text-faint;
+        font-size: Theme.font-xs;
+        vertical-alignment: center;
+        horizontal-stretch: 1;
+        overflow: elide;
+    }
+}
+
+/// 表单字段标签。
+export component FieldLabel inherits Text {
+    color: Theme.text-dim;
+    font-size: Theme.font-sm;
+    overflow: elide;
 }
 
 /// 一个小圆点状态灯。
@@ -50,5 +101,6 @@ export component Field inherits HorizontalLayout {
         font-size: 12px;
         font-weight: 600;
         vertical-alignment: center;
+        overflow: elide;
     }
 }
