@@ -83,10 +83,13 @@
 - AFC 轴互通：`repl-core::afc_axis` 导出固定语法 `- 帧号 动作 目标 (x,y) 朝向 · 说明`，元数据写入 AFC
   跳过的 `<!-- replicator-meta … -->`；导入按“固定语法 → 关键词 + 干员目录 → 注释”三级处理，结果为
   未保存草稿，缺失字段由诊断阻止运行。仓库示例作业全部无损往返；只读写所选文本文件。
+- 旧 Rust 直接脉冲已删除：`repl-core::stepping`（`GapTuner`）、`repl-input::stepper`（`PauseController`）、
+  `step-test`/`step-sweep` 和配置项 `initial_gap_ms`。状态机改用只计数的 `StepStats` 汇报逐帧结果；
+  旧 `config.json` 中的 `initial_gap_ms` 加载时被忽略。
 - 界面接线测试改为 Slint 无窗口测试后端（`i-slint-backend-testing`，版本与 slint 精确一致）真实创建
   `MainWindow`：点击按钮、逐字输入、读回属性，不再检查源码里有没有某段文字；只保留“扫描编队不得依赖输入
   接口”这一条刻意的源码扫描。debug 构建为此开启 Slint 调试信息，release 不受影响。
-- 当前自动门禁通过：`cargo test --workspace` 共 273 项，包含编辑页 MAA 资源选择/归一化/持久化入口、
+- 当前自动门禁通过：`cargo test --workspace` 共 263 项，包含编辑页 MAA 资源选择/归一化/持久化入口、
   编辑页实时尺子帧、部署后稳定屏障、
   Resume 专用超时原因、地图装置 Skill/location、MAA 干员目录搜索、真实 MAA OCR 资源/ORT 初始化
   和部署四方向客户区边界回归；
@@ -107,7 +110,6 @@
 - 当前 `0.3.0` 发布构建：`target\release-v0.3.0\release\repl-app.exe`，大小 35,073,536 字节，SHA-256
   `2F6AE9B059B8D79D6CB302E634D8D9C1B0238F134A23AEEC2D2A1782685C98AE`；体积主要来自静态链接 ONNX Runtime，发布时无需额外 DLL。相对 `0.2.0` 只改动编辑器
   界面、时间轴交互和 AFC 轴互通，复刻链路未改，但这些新增界面尚未实机验收，不能反向替换 M8/M9 记录。
-  `initial_gap_ms` 只为旧配置兼容保留，不再影响主复刻。
 - 上一版 `0.2.0` 发布构建：大小 34,513,920 字节，SHA-256
   `6BB8CD2DD6E3F1748CE0C31C96CE49519D5595E2C5F23295A31D0741C924BCC4`。
 - 状态：编辑器界面重做、时间轴滚动/缩放和 AFC 轴互通已 locally verified，并纳入 `0.3.0` 发布内容、

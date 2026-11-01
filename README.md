@@ -218,8 +218,6 @@ Release 构建会在 `target/release/` 生成：
 | `formation-scan.exe` | 战前编队 OCR 只读诊断 |
 | `deploy-scan.exe` | 部署栏识别诊断 |
 | `tile-preview.exe` | 在截图上绘制地图格子投影 |
-| `step-test.exe` | 旧 Rust 直接脉冲诊断，不属于主复刻路径 |
-| `step-sweep.exe` | 旧脉冲传递函数扫描 |
 
 运行日志写入 `repl-app.exe` 同目录的 `replicator.log`。
 

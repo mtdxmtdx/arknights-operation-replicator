@@ -25,7 +25,6 @@ pub mod gesture;
 pub mod job_document;
 pub mod level;
 pub mod machine;
-pub mod stepping;
 pub mod tile;
 pub mod viewport;
 
@@ -38,8 +37,7 @@ pub use job_document::{
     ActionDraft, ActionId, Diagnostic, DiagnosticSeverity, JobDocument, JobDocumentError,
 };
 pub use level::{Level, LevelError, LevelPack, TileKey};
-pub use machine::{AbortReason, Command, Completion, FrameView, Machine, Phase};
-pub use stepping::GapTuner;
+pub use machine::{AbortReason, Command, Completion, FrameView, Machine, Phase, StepStats};
 pub use tile::TileProjection;
 pub use viewport::{HAnchor, VAnchor, Viewport};
 

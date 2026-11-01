@@ -20,9 +20,37 @@ use std::time::Duration;
 
 use crate::{
     copilot::{ActionType, Copilot},
-    stepping::GapTuner,
     ContinuationPlan,
 };
+
+/// AFA 逐帧动作的结算统计，只计数、不参与任何决策。
+///
+/// 逐帧由 AFA `[Hotkeys]/33ms` 完成，间隔不再由 Rust 调整；这里只记录每次逐帧实际推进了
+/// 几帧，供复刻结束时汇报。`overshoot_pulses` 非零说明出现过一次跨两帧以上，帧精度不可信。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StepStats {
+    /// 已结算的逐帧次数。
+    pub pulses: u32,
+    /// 其中推进 0 帧的次数（倒退也按没推进计）。
+    pub zero_frame_pulses: u32,
+    /// 其中推进 ≥2 帧的次数。验收要求必须为 0。
+    pub overshoot_pulses: u32,
+}
+
+impl StepStats {
+    pub fn observe(&mut self, advanced_frames: i64) {
+        self.pulses += 1;
+        match advanced_frames {
+            i64::MIN..=0 => self.zero_frame_pulses += 1,
+            1 => {}
+            _ => self.overshoot_pulses += 1,
+        }
+    }
+
+    pub fn had_overshoot(&self) -> bool {
+        self.overshoot_pulses > 0
+    }
+}
 
 /// 提前多少帧从"正常运行"切到"逐帧推进"。
 ///
@@ -241,7 +269,7 @@ pub struct Machine {
     pause_probe: Option<(i64, u32)>,
     /// 最近一个输入动作完成后已经看到的 0.2x 样本数；`None` 表示未开启宽限。
     point_two_samples: Option<u32>,
-    tuner: GapTuner,
+    step_stats: StepStats,
     abort: Option<AbortReason>,
 }
 
@@ -287,7 +315,7 @@ impl Machine {
             pulse_from: 0,
             pause_probe: None,
             point_two_samples: None,
-            tuner: GapTuner::default(),
+            step_stats: StepStats::default(),
             abort: None,
         }
     }
@@ -387,8 +415,8 @@ impl Machine {
         self.continuation_cutoff
     }
 
-    pub fn tuner(&self) -> &GapTuner {
-        &self.tuner
+    pub fn step_stats(&self) -> &StepStats {
+        &self.step_stats
     }
 
     pub fn copilot(&self) -> &Copilot {
@@ -604,7 +632,7 @@ impl Machine {
                     "two_paused_samples"
                 }
             );
-            self.tuner.observe(delta);
+            self.step_stats.observe(delta);
             self.pulse_in_flight = false;
             self.pulse_settle_samples = 0;
             self.pulse_seen_running = false;
@@ -984,14 +1012,14 @@ mod tests {
 
         // 脉冲顺序是 ESC → pauseBattle，尺子可能先看到前半段的运行态。
         m.observe(&view(12, 56, false));
-        assert_eq!(m.tuner().pulses, 0, "中间态不能提前结算脉冲");
+        assert_eq!(m.step_stats().pulses, 0, "中间态不能提前结算脉冲");
         assert!(
             matches!(m.next_command(), Command::AwaitFrame { .. }),
             "脉冲中间态不能补发 Pause，否则会把游戏再次切回运行"
         );
 
         m.observe(&view(13, 56, true));
-        assert_eq!(m.tuner().pulses, 1, "最终暂停态才结算一次脉冲");
+        assert_eq!(m.step_stats().pulses, 1, "最终暂停态才结算一次脉冲");
         assert_eq!(m.next_command(), Command::Pulse);
     }
 
@@ -1011,14 +1039,14 @@ mod tests {
         // 第一条 paused 不能让状态机进入 Execute，否则动作前会发现 running，
         // 而这发尚未收尾的脉冲还会继续把游戏推到下一帧。
         m.observe(&view(12, 60, true));
-        assert_eq!(m.tuner().pulses, 0, "单条旧 paused 不能结算脉冲");
+        assert_eq!(m.step_stats().pulses, 0, "单条旧 paused 不能结算脉冲");
         assert!(matches!(m.next_command(), Command::AwaitFrame { .. }));
 
         m.observe(&view(13, 60, false));
         assert!(matches!(m.next_command(), Command::AwaitFrame { .. }));
 
         m.observe(&view(14, 60, true));
-        assert_eq!(m.tuner().pulses, 1);
+        assert_eq!(m.step_stats().pulses, 1);
         assert_eq!(m.next_command(), Command::Execute { index: 1 });
     }
 
@@ -1111,31 +1139,35 @@ mod tests {
         m.completed(Completion::PauseSent);
         confirm_runtime_pause(&mut m, 11, 58);
 
-        // 连发三次脉冲但帧数纹丝不动 —— 必须继续重试，而不是中止。
-        // 实测空脉冲率约 42%，连着几次是常态；间隔也不该因此漂移
-        // （实测证明加大间隔对推进量没有帮助，只增加跨帧风险）。
-        let gap_before = m.tuner().gap_ms();
+        // 连发五次逐帧但帧数纹丝不动 —— 必须继续重试，而不是中止；
+        // 空转只计入统计，不算跨帧。
         let mut frame_id = 12;
-        for _ in 0..3 {
+        for _ in 0..5 {
             assert_eq!(m.next_command(), Command::Pulse);
             m.completed(Completion::PulseSent);
             confirm_pulse_without_running(&mut m, &mut frame_id, 58);
         }
         assert_eq!(m.phase(), Phase::Stepping, "空脉冲不应中止");
-        assert_eq!(m.tuner().gap_ms(), gap_before, "零星空脉冲不该改变间隔");
-        assert_eq!(m.tuner().zero_frame_pulses, 3);
-        assert!(!m.tuner().had_overshoot());
+        assert_eq!(m.step_stats().pulses, 5);
+        assert_eq!(m.step_stats().zero_frame_pulses, 5);
+        assert!(!m.step_stats().had_overshoot());
+    }
 
-        // 继续空转到第 5 次才小幅加大 —— 那才说明间隔可能真的偏小
-        for _ in 0..2 {
-            assert_eq!(m.next_command(), Command::Pulse);
-            m.completed(Completion::PulseSent);
-            confirm_pulse_without_running(&mut m, &mut frame_id, 58);
+    #[test]
+    fn step_stats_classify_advances() {
+        let mut stats = StepStats::default();
+        for advanced in [0, 1, 2, -1, 1, 3] {
+            stats.observe(advanced);
         }
-        assert!(
-            m.tuner().gap_ms() > gap_before,
-            "连续 5 次空脉冲后应当试探性加大"
+        assert_eq!(
+            stats,
+            StepStats {
+                pulses: 6,
+                zero_frame_pulses: 2,
+                overshoot_pulses: 2,
+            }
         );
+        assert!(stats.had_overshoot());
     }
 
     #[test]
@@ -1179,13 +1211,13 @@ mod tests {
         let mut blocked = view(12, 55, true);
         blocked.trustworthy = false;
         assert!(!m.observe(&blocked), "不可信样本必须被丢弃");
-        assert_eq!(m.tuner().pulses, 0, "不可信样本不该喂给整定器");
+        assert_eq!(m.step_stats().pulses, 0, "不可信样本不该喂给整定器");
         assert_eq!(m.cursor(), 55);
 
         // 恢复正常后才计数
         let mut frame_id = 13;
         confirm_pulse_without_running(&mut m, &mut frame_id, 56);
-        assert_eq!(m.tuner().pulses, 1);
+        assert_eq!(m.step_stats().pulses, 1);
         assert_eq!(m.cursor(), 56);
     }
 

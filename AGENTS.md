@@ -51,7 +51,8 @@ cargo build --release
 - 非最终 Deploy 动作确认后必须再经过 500ms 的目标帧可信 `1x_paused` 稳定窗口，随后才允许同帧
   下一动作或单次 Resume；窗口内出现 running、错帧、非 1x 或离战立即中止。
 - `Output`、`Finish` 和最终动作后的收尾都是零输入；`after_last_action` 只兼容解析。
-- `PauseController` 和 `initial_gap_ms` 只保留给旧诊断/配置兼容，主复刻不得调用 Rust 直接脉冲。
+- Rust 直接脉冲（`PauseController`、`GapTuner`、`step-test`、`step-sweep`、`initial_gap_ms`）已删除，不得重新引入；
+  逐帧只走 AFA `33ms`，状态机用 `StepStats` 只计数结算结果。旧 `config.json` 里的 `initial_gap_ms` 会被忽略。
 - `afa-step-test` 可调用同一 AFA `33ms` 热键做最多 500 次诊断；主复刻与诊断均以尺子证据结算。
 - NCC 前先重采样到 1280×720。`heightType` 原始值与 MAA 枚举名相反，禁止按名称修正。
 - “扫描编队”只允许截图和本地 OCR，禁止访问 AFA 或输入接口。确认结果是绑定作业/窗口/尺寸且
