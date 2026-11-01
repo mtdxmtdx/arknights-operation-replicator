@@ -66,6 +66,8 @@ cargo build --release
   保存 `maa_resource_dir`，并热替换编辑器地图/搜索资源。取消或失败不得覆盖旧配置，也不得产生输入。
 - 编辑器时间轴视图起点、缩放由 UI 管理，Rust 只同步光标帧与 `editor-last-frame`，不得再按光标重置视图。
   Window 不写死最小尺寸；窄面板里的 Fluent `LineEdit`/`ComboBox` 必须显式压低 160px 默认最小宽度。
+- 界面接线测试用 Slint 测试后端驱动真实 `MainWindow`（按钮、输入、属性），不要写“源码里包含某段文字”
+  的断言；`i-slint-backend-testing` 必须与 slint 精确同版本，升级 slint 时同步修改。
 - AFC 轴导入/导出只读写用户所选文本文件，不访问 AFC 程序、游戏或 AFA；导出不改变作业保存状态，
   导入结果是未保存草稿，`A2` 这类格子写法不猜，缺失字段交给诊断阻止运行。
 

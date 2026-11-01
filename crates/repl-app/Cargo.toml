@@ -26,6 +26,10 @@ slint-build.workspace = true
 
 [dev-dependencies]
 repl-frames = { workspace = true, features = ["test-util"] }
+# 界面行为测试用的无窗口后端：真实创建 MainWindow、点击按钮、输入文字。
+# 它是 Slint 的内部 crate，不遵守 semver，版本必须与 Cargo.lock 里的 slint 完全一致；
+# 升级 slint 时要同步改这里。
+i-slint-backend-testing = "=1.17.1"
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [

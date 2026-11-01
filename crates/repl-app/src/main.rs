@@ -96,6 +96,34 @@ impl BindingBridge {
     }
 }
 
+/// 用户点“确认绑定”：只把选择交给工作线程并显示“正在保存”。面板必须保持打开，
+/// 等工作线程校验并原子保存成功后再由它关闭；否则保存失败时用户已经看不到面板。
+fn submit_binding_confirmation(ui: &MainWindow, bridge: &BindingBridge, choices: BindingChoices) {
+    bridge.submit(BindingResponse::Confirm(choices));
+    ui.set_binding_submitting(true);
+    ui.set_status_line("正在校验并保存绑定，请勿关闭程序…".into());
+}
+
+/// 只保留当前一代扫描的结果。用户重新扫描或取消后，旧线程迟到的结果必须丢弃，
+/// 不能覆盖新的扫描状态。
+fn drain_current_generation<A, B>(rx: &mpsc::Receiver<(u64, A, B)>, current: u64) -> Vec<(A, B)> {
+    let mut results = Vec::new();
+    while let Ok((generation, first, second)) = rx.try_recv() {
+        if generation == current {
+            results.push((first, second));
+        }
+    }
+    results
+}
+
+/// 战前编队识别结果只服务于从第 0 帧开始的精确复刻；风险继续一律不复用。
+fn formation_for_mode<T>(run_mode: &RunMode, pending: Option<T>) -> Option<T> {
+    match run_mode {
+        RunMode::FromZero => pending,
+        RunMode::Continue(_) => None,
+    }
+}
+
 /// The UI window handle is captured on the Slint thread and used only to make the
 /// binding panel visible once. The game window is never activated by this helper.
 #[derive(Clone, Copy, Debug)]
@@ -894,10 +922,8 @@ fn main() -> Result<(), slint::PlatformError> {
             Duration::from_millis(50),
             move || {
                 let Some(ui) = ui_weak.upgrade() else { return };
-                while let Ok((result_generation, job_names, result)) = formation_rx.try_recv() {
-                    if result_generation != generation.load(Ordering::Relaxed) {
-                        continue;
-                    }
+                let current = generation.load(Ordering::Relaxed);
+                for (job_names, result) in drain_current_generation(&formation_rx, current) {
                     ui.set_formation_scanning(false);
                     match result {
                         Ok(mut value) => {
@@ -1066,10 +1092,10 @@ fn main() -> Result<(), slint::PlatformError> {
         let bridge = Arc::clone(&bridge);
         let pending = Rc::clone(&pending_choices);
         ui.on_binding_confirm(move || {
-            bridge.submit(BindingResponse::Confirm(pending.borrow().clone()));
             if let Some(ui) = ui_weak.upgrade() {
-                ui.set_binding_submitting(true);
-                ui.set_status_line("正在校验并保存绑定，请勿关闭程序…".into());
+                submit_binding_confirmation(&ui, &bridge, pending.borrow().clone());
+            } else {
+                bridge.submit(BindingResponse::Confirm(pending.borrow().clone()));
             }
         });
     }
@@ -1715,6 +1741,7 @@ fn launch_run(
     pending_choices: Rc<RefCell<BindingChoices>>,
     binding_opers: Rc<RefCell<Vec<String>>>,
 ) {
+    let pending_formation = formation_for_mode(&run_mode, pending_formation);
     let ui_window = UiWindowControl::from_ui(ui);
     if ui_window.is_none() {
         append_log(
@@ -2910,55 +2937,173 @@ fn pick_axis_save_file() -> Option<String> {
 
 #[cfg(test)]
 mod editor_callback_tests {
+    //! 编辑器与复刻页接线测试。
+    //!
+    //! 界面相关的用例用 Slint 无窗口测试后端真实创建 `MainWindow`：点按钮、往输入框里
+    //! 输入、读回属性，验证的是行为而不是 `.slint`/`.rs` 源码里有没有某段文字。
+    //! 改文案、换布局不会让它们误报；接线真的断了才会失败。
     use super::*;
+    use i_slint_backend_testing::{AccessibleRole, ElementHandle, ElementQuery};
+    use slint::platform::{Key, PointerEventButton, WindowEvent};
+    use std::cell::Cell;
 
-    #[test]
-    fn editor_exposes_a_persistent_maa_resource_picker() {
-        let editor_ui = include_str!("../../../ui/main.slint");
-        let main_source = include_str!("main.rs");
-
-        assert!(editor_ui.contains("callback editor-select-resource()"));
-        assert!(editor_ui.contains("root.editor-select-resource()"));
-        assert!(editor_ui.contains("editor-resource-path"));
-        assert!(editor_ui.contains("MAA 资源"));
-        assert!(main_source.contains("on_editor_select_resource"));
-        assert!(main_source.contains("normalize_maa_resource_dir"));
-        assert!(main_source.contains("config.borrow().save()"));
-    }
-
-    #[test]
-    fn editor_field_tracks_the_next_selected_action_after_user_input() {
-        let editor_ui = include_str!("../../../ui/main.slint");
-        for property in [
-            "editor-selected-frame",
-            "editor-selected-x",
-            "editor-selected-y",
-            "editor-selected-doc",
-        ] {
-            assert!(
-                editor_ui.contains(&format!("value: root.{property}")),
-                "{property} must remain bound to its committed editor value"
-            );
+    /// 每个测试线程独立初始化一次无窗口后端，然后创建一个关掉免责声明的主窗口。
+    fn test_ui() -> MainWindow {
+        thread_local! {
+            static BACKEND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         }
-        assert!(editor_ui.contains("changed value =>"));
-        assert!(editor_ui.contains("root.text = root.value;"));
+        BACKEND.with(|ready| {
+            if !ready.get() {
+                i_slint_backend_testing::init_no_event_loop();
+                ready.set(true);
+            }
+        });
+        let ui = MainWindow::new().unwrap();
+        ui.window().set_size(slint::LogicalSize::new(1100.0, 720.0));
+        ui.set_disclaimer_visible(false);
+        ui.show().unwrap();
+        ui
+    }
+
+    fn with_role(ui: &MainWindow, role: AccessibleRole) -> Vec<ElementHandle> {
+        ElementQuery::from_root(ui)
+            .match_descendants()
+            .match_accessible_role(role)
+            .find_all()
+    }
+
+    fn button(ui: &MainWindow, label: &str) -> ElementHandle {
+        ElementHandle::find_by_accessible_label(ui, label)
+            .find(|element| element.accessible_role() == Some(AccessibleRole::Button))
+            .unwrap_or_else(|| panic!("找不到按钮「{label}」"))
+    }
+
+    fn has_label(ui: &MainWindow, label: &str) -> bool {
+        ElementHandle::find_by_accessible_label(ui, label)
+            .next()
+            .is_some()
+    }
+
+    fn text_input_with_value(ui: &MainWindow, value: &str) -> ElementHandle {
+        with_role(ui, AccessibleRole::TextInput)
+            .into_iter()
+            .find(|element| element.accessible_value().as_deref() == Some(value))
+            .unwrap_or_else(|| panic!("找不到内容为「{value}」的输入框"))
+    }
+
+    fn press_enter(ui: &MainWindow) {
+        ui.window().dispatch_event(WindowEvent::KeyPressed {
+            text: Key::Return.into(),
+        });
+        ui.window().dispatch_event(WindowEvent::KeyReleased {
+            text: Key::Return.into(),
+        });
+    }
+
+    type Events = Rc<RefCell<Vec<String>>>;
+
+    fn events() -> Events {
+        Rc::new(RefCell::new(Vec::new()))
     }
 
     #[test]
-    fn editor_text_fields_commit_as_one_edit_instead_of_each_keystroke() {
-        let editor_ui = include_str!("../../../ui/main.slint");
+    fn editor_toolbar_buttons_reach_their_callbacks() {
+        let ui = test_ui();
+        let log = events();
+        macro_rules! record {
+            ($setter:ident, $name:expr) => {{
+                let log = Rc::clone(&log);
+                ui.$setter(move || log.borrow_mut().push($name.to_owned()));
+            }};
+        }
+        record!(on_editor_new, "new");
+        record!(on_editor_open, "open");
+        record!(on_editor_select_resource, "select-resource");
+        record!(on_editor_import_axis, "import-axis");
+        record!(on_editor_export_axis, "export-axis");
+        {
+            let log = Rc::clone(&log);
+            ui.on_editor_save(move |save_as| log.borrow_mut().push(format!("save({save_as})")));
+        }
+        {
+            let log = Rc::clone(&log);
+            ui.on_editor_add_action(move |kind| log.borrow_mut().push(format!("add({kind})")));
+        }
 
-        assert!(
-            editor_ui.contains("component CommitLineEdit"),
-            "editor fields need a draft/commit boundary"
+        for label in [
+            "新建",
+            "打开",
+            "保存",
+            "另存为",
+            "选择…",
+            "导入轴",
+            "导出轴",
+            "+ 部署",
+            "+ 技能 / 装置",
+            "+ 撤退",
+            "+ 注释",
+        ] {
+            button(&ui, label).invoke_accessible_default_action();
+        }
+        assert_eq!(
+            *log.borrow(),
+            vec![
+                "new",
+                "open",
+                "save(false)",
+                "save(true)",
+                "select-resource",
+                "import-axis",
+                "export-axis",
+                "add(Deploy)",
+                "add(Skill)",
+                "add(Retreat)",
+                "add(Output)",
+            ]
         );
+
+        // 撤销 / 重做跟随编辑器历史启用，不能在没有历史时可点。
+        assert_eq!(button(&ui, "撤销").accessible_enabled(), Some(false));
+        ui.set_editor_can_undo(true);
+        assert_eq!(button(&ui, "撤销").accessible_enabled(), Some(true));
+    }
+
+    #[test]
+    fn frame_field_commits_once_on_enter_and_then_follows_the_next_selection() {
+        let ui = test_ui();
+        let commits = events();
+        {
+            let commits = Rc::clone(&commits);
+            ui.on_editor_set_action(move |field, value| {
+                commits.borrow_mut().push(format!("{field}={value}"));
+            });
+        }
+        ui.set_editor_selected_id(1);
+        ui.set_editor_selected_kind("部署".into());
+        ui.set_editor_selected_frame("10".into());
+
+        let field = text_input_with_value(&ui, "10");
+        field.mock_single_click(PointerEventButton::Left);
+        for keystroke in ["2", "24", "249"] {
+            field.set_accessible_value(keystroke);
+        }
         assert!(
-            !editor_ui.contains("edited => { root.editor-set-action(\"frame\", self.text); }"),
-            "frame edits must not enter undo history on every keystroke"
+            commits.borrow().is_empty(),
+            "逐字输入不能产生修改，否则撤销历史会出现 2、24 这样的中间值"
         );
-        assert!(
-            editor_ui.contains("commit(value) => { root.editor-set-action(\"frame\", value); }"),
-            "the confirmed frame value must still reach the editor callback"
+        press_enter(&ui);
+        assert_eq!(*commits.borrow(), vec!["frame=249"]);
+
+        // 焦点移走后切换到另一个动作：输入框必须显示新动作的值，而不是停在刚才输入的 249。
+        text_input_with_value(&ui, "0").mock_single_click(PointerEventButton::Left);
+        ui.set_editor_selected_frame("300".into());
+        // `changed` 回调在事件循环的下一轮才执行；测试里没有事件循环，手动推进一次。
+        slint::platform::update_timers_and_animations();
+        assert_eq!(field.accessible_value().as_deref(), Some("300"));
+        assert_eq!(
+            commits.borrow().len(),
+            1,
+            "失焦时没有未提交草稿，不能重复提交"
         );
     }
 
@@ -2980,85 +3125,140 @@ mod editor_callback_tests {
     }
 
     #[test]
-    fn editor_dropdowns_use_roster_and_five_supported_directions() {
-        let editor_ui = include_str!("../../../ui/main.slint");
-        assert!(editor_ui.contains("model: root.editor-operator-options;"));
-        assert!(editor_ui.contains("model: root.editor-direction-options;"));
-        assert!(editor_ui.contains("[\"上\", \"下\", \"左\", \"右\", \"无方向\"]"));
+    fn direction_dropdown_offers_five_directions_in_the_order_rust_expects() {
+        let ui = test_ui();
+        let options: Vec<String> = ui
+            .get_editor_direction_options()
+            .iter()
+            .map(|label| label.to_string())
+            .collect();
+        assert_eq!(options, ["上", "下", "左", "右", "无方向"]);
 
-        for (label, direction, index) in [
-            ("上", Direction::Up, 0),
-            ("下", Direction::Down, 1),
-            ("左", Direction::Left, 2),
-            ("右", Direction::Right, 3),
-            ("无方向", Direction::None, 4),
+        for (label, direction) in [
+            ("上", Direction::Up),
+            ("下", Direction::Down),
+            ("左", Direction::Left),
+            ("右", Direction::Right),
+            ("无方向", Direction::None),
         ] {
             assert_eq!(parse_editor_direction(label), direction);
-            assert_eq!(direction_index(direction), index);
+            // 下拉框按索引回显方向：Rust 侧索引必须指向同一个标签。
+            assert_eq!(options[direction_index(direction) as usize], label);
         }
     }
 
     #[test]
-    fn editor_roster_addition_exposes_local_catalog_search() {
-        let editor_ui = include_str!("../../../ui/main.slint");
-        let main_source = include_str!("main.rs");
+    fn operator_search_box_queries_and_offers_catalog_results() {
+        let ui = test_ui();
+        let log = events();
+        {
+            let log = Rc::clone(&log);
+            ui.on_editor_search_operators(move |query| {
+                log.borrow_mut().push(format!("search={query}"));
+            });
+        }
+        {
+            let log = Rc::clone(&log);
+            ui.on_editor_select_operator_search_result(move |name| {
+                log.borrow_mut().push(format!("pick={name}"));
+            });
+        }
 
-        assert!(editor_ui.contains("placeholder-text: \"搜索或手动输入干员\""));
-        assert!(editor_ui.contains("editor-operator-search-results"));
-        assert!(editor_ui.contains("callback editor-search-operators(string)"));
-        assert!(editor_ui.contains("callback editor-select-operator-search-result(string)"));
-        assert!(main_source.contains("OperatorCatalog::load(&catalog_path)"));
-        assert!(main_source.contains("catalog.search_names(query.as_str(), 12)"));
-        assert!(main_source.contains("ui.on_editor_select_operator_search_result"));
+        let search = with_role(&ui, AccessibleRole::TextInput)
+            .into_iter()
+            .find(|element| {
+                element.accessible_placeholder_text().as_deref() == Some("搜索或手动输入干员")
+            })
+            .expect("编队区应有干员搜索框");
+        search.set_accessible_value("安");
+        ui.set_editor_operator_search_results(ModelRc::new(VecModel::from(vec![
+            SharedString::from("安赛尔"),
+        ])));
+        button(&ui, "安赛尔").invoke_accessible_default_action();
+
+        assert_eq!(*log.borrow(), vec!["search=安", "pick=安赛尔"]);
     }
 
     #[test]
-    fn editor_shows_live_ruler_absolute_frame_without_enabling_follow_mode() {
-        let editor_ui = include_str!("../../../ui/main.slint");
-        let main_source = include_str!("main.rs");
-
-        assert!(editor_ui.contains("in property <int> editor-ruler-frame: -1;"));
-        assert!(editor_ui.contains("Text { text: \"尺子\";"));
-        assert!(editor_ui.contains("root.editor-ruler-frame >= 0"));
-        assert!(main_source.contains("ui.set_editor_ruler_frame("));
-        assert!(main_source.contains("snapshot.total_elapsed_frames.clamp"));
+    fn editor_shows_the_live_ruler_frame_without_turning_on_follow_mode() {
+        let ui = test_ui();
+        assert!(has_label(&ui, "未连接"));
+        ui.set_ruler_connected(true);
+        ui.set_editor_ruler_frame(123);
+        assert!(has_label(&ui, "F123"), "尺子连接后应显示它的绝对帧");
+        assert!(!ui.get_editor_follow_ruler(), "显示尺子帧不能顺带打开跟随");
         assert!(EDITOR_RULER_REFRESH <= Duration::from_millis(34));
     }
 
     #[test]
-    fn editor_exposes_map_device_skill_location_and_clear_mode() {
-        let editor_ui = include_str!("../../../ui/main.slint");
-        let main_source = include_str!("main.rs");
+    fn location_only_skill_lands_on_the_map_device_lane_and_can_clear_its_tile() {
+        let ui = test_ui();
+        let job = r#"{"stage_name":"main_01-07","frame_replicator":{"version":1,"speed":"1x"},
+            "opers":[],"actions":[{"type":"Skill","frame":30,"location":[3,4]}]}"#;
+        let editor = EditorState::open(job, None).unwrap();
+        refresh_editor(&ui, &editor, &Rc::new(RefCell::new(None)));
+        let row = ui.get_editor_actions().row_data(0).expect("应有一个动作行");
+        assert_eq!(row.lane, "地图装置");
+        assert_eq!(row.location, "3,4");
 
-        assert!(editor_ui.contains("+ 技能 / 装置"));
-        assert!(editor_ui.contains(
-            "root.editor-selected-kind == \"部署\" || root.editor-selected-kind == \"技能\""
-        ));
-        assert!(editor_ui.contains("技能目标格（地图装置必填；普通干员可留空）"));
-        assert!(editor_ui.contains("callback editor-clear-location()"));
-        assert!(main_source.contains("ui.on_editor_clear_location"));
-        assert!(main_source.contains("\"地图装置\".into()"));
+        let cleared = Rc::new(Cell::new(false));
+        {
+            let cleared = Rc::clone(&cleared);
+            ui.on_editor_clear_location(move || cleared.set(true));
+        }
+        ui.set_editor_selected_id(1);
+        ui.set_editor_selected_kind("技能".into());
+        let clear = "清除格子（改为按名称定位）";
+        assert_eq!(
+            button(&ui, clear).accessible_enabled(),
+            Some(false),
+            "没有格子时不能清除"
+        );
+        ui.set_editor_selected_x("3".into());
+        assert_eq!(button(&ui, clear).accessible_enabled(), Some(true));
+        button(&ui, clear).invoke_accessible_default_action();
+        assert!(cleared.get());
     }
 
     #[test]
-    fn binding_confirmation_waits_for_commit_and_uses_job_roster() {
-        let main_source = include_str!("main.rs");
-        let binding_ui = include_str!("../../../ui/main.slint");
-        let callback_start = main_source.find("ui.on_binding_confirm").unwrap();
-        let callback_end = main_source[callback_start..]
-            .find("ui.on_binding_cancel")
-            .map(|offset| callback_start + offset)
-            .unwrap();
-        let callback = &main_source[callback_start..callback_end];
+    fn binding_confirmation_keeps_the_panel_open_until_the_worker_saves() {
+        let ui = test_ui();
+        ui.set_editor_mode(false);
+        ui.set_binding_visible(true);
+        ui.set_binding_options(ModelRc::new(VecModel::from(vec![
+            SharedString::from("— 当前卡片不绑定 —"),
+            SharedString::from("桃金娘"),
+        ])));
+        let card = |index| CardRow {
+            index,
+            role: "先锋".into(),
+            available: true,
+            cooling: false,
+            bound_to: SharedString::new(),
+            selected_index: 0,
+        };
+        ui.set_cards(ModelRc::new(VecModel::from(vec![card(0), card(1)])));
+        assert_eq!(
+            ElementHandle::find_by_element_type_name(&ui, "ComboBox").count(),
+            2,
+            "每张可见卡片都必须从作业编队下拉选择，而不是自由输入"
+        );
 
+        let bridge = BindingBridge {
+            response: Mutex::new(None),
+        };
+        submit_binding_confirmation(&ui, &bridge, vec![(1, "桃金娘".into())]);
         assert!(
-            !callback.contains("set_binding_visible(false)"),
-            "确认只能提交响应；必须等工作线程验证并保存后再关闭绑定面板"
+            ui.get_binding_visible(),
+            "确认后必须等工作线程保存成功才能关面板"
         );
-        assert!(
-            binding_ui.contains("model: root.binding-options"),
-            "可见绑定必须从作业编队下拉选择，不能继续使用自由文本"
-        );
+        assert!(ui.get_binding_submitting());
+        match bridge.take() {
+            Some(BindingResponse::Confirm(choices)) => {
+                assert_eq!(choices, vec![(1, "桃金娘".into())]);
+            }
+            _ => panic!("确认没有交给工作线程"),
+        }
     }
 
     #[test]
@@ -3121,16 +3321,66 @@ mod editor_callback_tests {
     }
 
     #[test]
-    fn formation_ui_is_explicit_confirmable_and_generation_guarded() {
-        let main_source = include_str!("main.rs");
-        let ui_source = include_str!("../../../ui/main.slint");
-        assert!(ui_source.contains("text: root.formation-scanning ? \"扫描中…\" : \"扫描编队\""));
-        assert!(ui_source.contains("callback formation-confirm()"));
-        assert!(ui_source.contains("— 忽略此槽位 —"));
-        assert!(main_source.contains("result_generation != generation.load(Ordering::Relaxed)"));
-        assert!(main_source.contains("RunMode::Continue(plan),\n                None,"));
+    fn formation_scan_button_reflects_scanning_and_confirm_reaches_its_callback() {
+        let ui = test_ui();
+        ui.set_editor_mode(false);
+        let log = events();
+        {
+            let log = Rc::clone(&log);
+            ui.on_scan_formation(move || log.borrow_mut().push("scan".into()));
+        }
+        {
+            let log = Rc::clone(&log);
+            ui.on_formation_confirm(move || log.borrow_mut().push("confirm".into()));
+        }
+
+        ui.set_formation_scanning(true);
+        assert_eq!(button(&ui, "扫描中…").accessible_enabled(), Some(false));
+        ui.set_formation_scanning(false);
+        let scan = button(&ui, "扫描编队");
+        assert_eq!(scan.accessible_enabled(), Some(true));
+        scan.invoke_accessible_default_action();
+
+        ui.set_formation_visible(true);
+        button(&ui, "确认本次编队").invoke_accessible_default_action();
+        assert_eq!(*log.borrow(), vec!["scan", "confirm"]);
     }
 
+    #[test]
+    fn stale_formation_scan_results_are_dropped() {
+        let (tx, rx) = mpsc::channel();
+        tx.send((1, "旧编队", "旧结果")).unwrap();
+        tx.send((2, "新编队", "新结果")).unwrap();
+        tx.send((1, "迟到编队", "迟到结果")).unwrap();
+        assert_eq!(
+            drain_current_generation(&rx, 2),
+            vec![("新编队", "新结果")],
+            "重新扫描或取消后，旧一代迟到的结果不能覆盖当前状态"
+        );
+    }
+
+    #[test]
+    fn risk_continuation_never_reuses_a_formation_scan() {
+        let plan = ContinuationPlan {
+            cutoff_frame: 120,
+            next_action_index: 1,
+            battlefield: Default::default(),
+            visible_binding_names: Vec::new(),
+            archived_binding_names: Vec::new(),
+        };
+        assert_eq!(
+            formation_for_mode(&RunMode::FromZero, Some("扫描")),
+            Some("扫描")
+        );
+        assert_eq!(
+            formation_for_mode(&RunMode::Continue(plan), Some("扫描")),
+            None
+        );
+    }
+
+    /// 刻意保留的源码扫描：它守的是“只读扫描不得依赖输入接口”这条架构边界。
+    /// 行为测试只能证明某次调用没有产生输入，证明不了代码里根本没有这条路径，
+    /// 所以这里直接检查扫描函数体不引用 AFA、Session 或任何注入 API。
     #[test]
     fn read_only_formation_scan_helper_has_no_input_dependency() {
         let source = include_str!("main.rs");
