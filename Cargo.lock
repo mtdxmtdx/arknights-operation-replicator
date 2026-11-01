@@ -4146,6 +4146,7 @@ dependencies = [
  "anyhow",
  "base64",
  "env_logger",
+ "i-slint-backend-testing",
  "image",
  "log",
  "raw-window-handle",
