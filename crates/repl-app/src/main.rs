@@ -379,6 +379,7 @@ fn main() -> Result<(), slint::PlatformError> {
         ui.on_editor_new(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             *editor.borrow_mut() = EditorState::default();
+            ui.set_editor_notice("".into());
             refresh_editor(&ui, &editor.borrow(), &copilot);
             refresh_editor_map(&ui, level_pack.borrow().as_ref(), &editor.borrow());
         });
@@ -446,6 +447,7 @@ fn main() -> Result<(), slint::PlatformError> {
             match opened {
                 Ok(state) => {
                     *editor.borrow_mut() = state;
+                    ui.set_editor_notice("".into());
                     refresh_editor(&ui, &editor.borrow(), &copilot);
                     refresh_editor_map(&ui, level_pack.borrow().as_ref(), &editor.borrow());
                 }
@@ -475,6 +477,62 @@ fn main() -> Result<(), slint::PlatformError> {
                 Ok(()) => {}
                 Err(error) => ui.set_editor_path(format!("保存失败：{error}").into()),
             }
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let editor = Rc::clone(&editor);
+        let copilot = Rc::clone(&copilot);
+        let level_pack = Rc::clone(&level_pack);
+        let operator_catalog = Rc::clone(&operator_catalog);
+        ui.on_editor_import_axis(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let Some(path) = pick_axis_file().map(std::path::PathBuf::from) else {
+                return;
+            };
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(error) => {
+                    ui.set_editor_notice(format!("导入失败：{error}").into());
+                    return;
+                }
+            };
+            // 干员目录只用于从自由文本里认干员名；没加载资源时退化为只认固定语法和已声明名字。
+            let names = operator_catalog
+                .borrow()
+                .as_ref()
+                .map_or_else(Vec::new, |catalog| catalog.display_names());
+            let imported = repl_core::import_axis(&text, &names);
+            for warning in &imported.warnings {
+                log::warn!("AFC 轴导入 {}：{warning}", path.display());
+            }
+            let notice = axis_import_notice(&path, &imported);
+            *editor.borrow_mut() = EditorState::from_imported(imported.document);
+            refresh_editor(&ui, &editor.borrow(), &copilot);
+            refresh_editor_map(&ui, level_pack.borrow().as_ref(), &editor.borrow());
+            ui.set_editor_notice(notice.into());
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let editor = Rc::clone(&editor);
+        ui.on_editor_export_axis(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let Some(path) = pick_axis_save_file().map(std::path::PathBuf::from) else {
+                return;
+            };
+            let notice = match editor.borrow().export_axis(&path) {
+                Ok((written, skipped)) => {
+                    let mut notice =
+                        format!("已导出 AFC 轴：{}（{written} 条）", file_label(&path));
+                    if skipped > 0 {
+                        notice.push_str(&format!("，{skipped} 个动作缺帧号未导出"));
+                    }
+                    notice
+                }
+                Err(error) => format!("导出失败：{error:#}"),
+            };
+            ui.set_editor_notice(notice.into());
         });
     }
     {
@@ -2711,21 +2769,70 @@ fn pick_maa_resource_dir(owner: Option<isize>) -> Option<String> {
     selected
 }
 
-/// 打开系统的"打开文件"对话框。
-///
-/// 直接用 Win32 的 `GetOpenFileNameW`，省掉一个 GUI 依赖。
+fn file_label(path: &std::path::Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+/// 导入结果摘要：精确 / 关键词 / 注释三类分开报，让用户知道哪些需要人工核对。
+fn axis_import_notice(path: &std::path::Path, imported: &repl_core::AxisImport) -> String {
+    let mut notice = format!(
+        "已导入 {}：{} 条按固定格式还原",
+        file_label(path),
+        imported.exact
+    );
+    if imported.guessed > 0 {
+        notice.push_str(&format!("，{} 条按关键词识别（请核对）", imported.guessed));
+    }
+    if imported.notes > 0 {
+        notice.push_str(&format!("，{} 条转为注释", imported.notes));
+    }
+    if !imported.warnings.is_empty() {
+        notice.push_str(&format!("；{} 条提示见日志", imported.warnings.len()));
+    }
+    notice
+}
+
+const JOB_FILE_FILTER: &str = "作业文件 (*.json)\0*.json\0所有文件\0*.*\0\0";
+const AXIS_FILE_FILTER: &str = "AFC 轴文件 (*.md;*.txt)\0*.md;*.txt\0所有文件\0*.*\0\0";
+
 #[cfg(windows)]
 fn pick_job_file() -> Option<String> {
+    pick_open_file(JOB_FILE_FILTER, "选择帧复刻作业")
+}
+
+/// 打开系统的“另存为”对话框。编辑器允许保存尚未通过校验的草稿。
+#[cfg(windows)]
+fn pick_save_file() -> Option<String> {
+    pick_save_path(JOB_FILE_FILTER, "保存帧复刻作业", "json")
+}
+
+#[cfg(windows)]
+fn pick_axis_file() -> Option<String> {
+    pick_open_file(AXIS_FILE_FILTER, "选择 AFC 轴文件")
+}
+
+#[cfg(windows)]
+fn pick_axis_save_file() -> Option<String> {
+    pick_save_path(AXIS_FILE_FILTER, "导出 AFC 轴文件", "md")
+}
+
+/// 打开系统的"打开文件"对话框。
+///
+/// 直接用 Win32 的 `GetOpenFileNameW`，省掉一个 GUI 依赖。`filter` 必须是以双 `\0`
+/// 结尾的 Win32 过滤串。
+#[cfg(windows)]
+fn pick_open_file(filter: &str, title: &str) -> Option<String> {
     use windows::core::PCWSTR;
     use windows::Win32::UI::Controls::Dialogs::{
         GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_PATHMUSTEXIST, OPENFILENAMEW,
     };
 
     let mut buffer = [0u16; 1024];
-    let filter: Vec<u16> = "作业文件 (*.json)\0*.json\0所有文件\0*.*\0\0"
-        .encode_utf16()
-        .collect();
-    let title: Vec<u16> = "选择帧复刻作业\0".encode_utf16().collect();
+    let filter: Vec<u16> = filter.encode_utf16().collect();
+    let title: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
 
     let mut ofn = OPENFILENAMEW {
         lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
@@ -2745,20 +2852,18 @@ fn pick_job_file() -> Option<String> {
     Some(String::from_utf16_lossy(&buffer[..end]))
 }
 
-/// 打开系统的“另存为”对话框。编辑器允许保存尚未通过校验的草稿。
+/// 打开系统的“另存为”对话框，`extension` 是用户没写扩展名时补上的默认值。
 #[cfg(windows)]
-fn pick_save_file() -> Option<String> {
+fn pick_save_path(filter: &str, title: &str, extension: &str) -> Option<String> {
     use windows::core::PCWSTR;
     use windows::Win32::UI::Controls::Dialogs::{
         GetSaveFileNameW, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
     };
 
     let mut buffer = [0u16; 1024];
-    let filter: Vec<u16> = "作业文件 (*.json)\0*.json\0所有文件\0*.*\0\0"
-        .encode_utf16()
-        .collect();
-    let title: Vec<u16> = "保存帧复刻作业\0".encode_utf16().collect();
-    let extension: Vec<u16> = "json\0".encode_utf16().collect();
+    let filter: Vec<u16> = filter.encode_utf16().collect();
+    let title: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+    let extension: Vec<u16> = extension.encode_utf16().chain(Some(0)).collect();
     let mut ofn = OPENFILENAMEW {
         lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
         lpstrFilter: PCWSTR(filter.as_ptr()),
@@ -2791,6 +2896,16 @@ fn pick_maa_resource_dir(_owner: Option<isize>) -> Option<String> {
 #[cfg(not(windows))]
 fn pick_save_file() -> Option<String> {
     std::env::args().nth(2)
+}
+
+#[cfg(not(windows))]
+fn pick_axis_file() -> Option<String> {
+    std::env::var("REPLICATOR_AXIS_IMPORT").ok()
+}
+
+#[cfg(not(windows))]
+fn pick_axis_save_file() -> Option<String> {
+    std::env::var("REPLICATOR_AXIS_EXPORT").ok()
 }
 
 #[cfg(test)]

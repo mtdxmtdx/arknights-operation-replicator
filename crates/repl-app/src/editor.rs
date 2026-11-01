@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use repl_core::{ActionDraft, ActionId, JobDocument};
+use repl_core::{export_axis, ActionDraft, ActionId, JobDocument};
 
 use crate::config::atomic_write;
 
@@ -64,6 +64,15 @@ impl EditorState {
             path,
             ..Self::default()
         })
+    }
+
+    /// 用导入得到的文档开一个未保存的编辑会话（例如 AFC 轴导入）。
+    /// 没有路径，所以一开始就是“未保存”，保存时会要求选择位置。
+    pub fn from_imported(document: JobDocument) -> Self {
+        Self {
+            document,
+            ..Self::default()
+        }
     }
 
     pub fn document(&self) -> &JobDocument {
@@ -279,6 +288,15 @@ impl EditorState {
         Ok(target)
     }
 
+    /// 把当前作业导出成 AFC 打轴器的 Markdown 轴文件，不改变作业本身和未保存状态。
+    /// 返回 (写出的轴条数, 因缺帧号而跳过的动作数)。
+    pub fn export_axis(&self, path: &Path) -> Result<(usize, usize)> {
+        let (text, skipped) = export_axis(&self.document);
+        atomic_write(path, text.as_bytes())
+            .with_context(|| format!("无法导出轴到 {}", path.display()))?;
+        Ok((self.document.actions().len() - skipped, skipped))
+    }
+
     fn edit(&mut self, operation: impl FnOnce(&mut JobDocument)) {
         let before = self.snapshot();
         operation(&mut self.document);
@@ -355,6 +373,35 @@ mod tests {
         assert!(reopened.document().has_errors());
         assert_eq!(reopened.document().actions().len(), 1);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn axis_export_writes_markdown_without_touching_the_saved_state() {
+        let path = std::env::temp_dir().join(format!("repl-axis-{}.md", std::process::id()));
+        let mut editor = EditorState::default();
+        editor.set_cursor_frame(30);
+        editor.add_action("Retreat");
+        let dirty_before = editor.is_dirty();
+        let (written, skipped) = editor.export_axis(&path).unwrap();
+        assert_eq!((written, skipped), (1, 0));
+        assert_eq!(editor.is_dirty(), dirty_before);
+        assert!(editor.path().is_none(), "导出轴不能把作业路径改成 .md");
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("- 30 撤退"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn imported_documents_open_as_unsaved_drafts() {
+        let imported = repl_core::import_axis(
+            "- 10 部署 银灰 (1,2) 朝左
+",
+            &[],
+        );
+        let editor = EditorState::from_imported(imported.document);
+        assert!(editor.is_dirty());
+        assert!(editor.path().is_none());
+        assert_eq!(editor.document().actions().len(), 1);
     }
 
     #[test]

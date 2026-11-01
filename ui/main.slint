@@ -546,6 +546,8 @@ export component MainWindow inherits Window {
     in property <string> editor-title: "未命名作业";
     in property <string> editor-stage: "";
     in property <string> editor-path: "尚未保存";
+    // 导入 / 导出 AFC 轴后的一行结果摘要。
+    in property <string> editor-notice;
     in property <bool> editor-dirty;
     in property <bool> editor-can-undo;
     in property <bool> editor-can-redo;
@@ -621,6 +623,8 @@ export component MainWindow inherits Window {
     callback editor-new();
     callback editor-open();
     callback editor-save(bool);
+    callback editor-import-axis();
+    callback editor-export-axis();
     callback editor-select-resource();
     callback editor-undo();
     callback editor-redo();
@@ -721,7 +725,22 @@ export component MainWindow inherits Window {
                     Rectangle { width: 7px; }
                     Button { text: "撤销"; enabled: root.editor-can-undo; clicked => { root.editor-undo(); } }
                     Button { text: "重做"; enabled: root.editor-can-redo; clicked => { root.editor-redo(); } }
-                    Rectangle { horizontal-stretch: 1; }
+                    Rectangle { width: 7px; }
+                    VRule { }
+                    Rectangle { width: 7px; }
+                    // AFC（Arknights Frame Counter）打轴器的 Markdown 轴文件。
+                    Button { text: "导入轴"; clicked => { root.editor-import-axis(); } }
+                    Button { text: "导出轴"; clicked => { root.editor-export-axis(); } }
+                    Text {
+                        horizontal-stretch: 1;
+                        min-width: 0px;
+                        text: root.editor-notice;
+                        color: Theme.text-dim;
+                        font-size: Theme.font-sm;
+                        horizontal-alignment: right;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
                     VerticalLayout {
                         alignment: center;
                         Pill {

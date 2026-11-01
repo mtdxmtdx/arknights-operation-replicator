@@ -2,7 +2,7 @@
 
 **Arknights Operation Replicator** 是面向《明日方舟》PC 客户端的帧级作业编辑与复刻工具。
 
-当前版本：**0.2.0**。
+当前版本：**0.3.0**。
 
 它使用 [ArknightsCostBarRuler](https://github.com/ZeroAd-06/ArknightsCostBarRuler) 提供的绝对逻辑帧
 作为唯一时间基准，并通过 AFA（Arknights Frame Assistant）完成暂停、恢复、逐帧、技能和撤退。
@@ -39,6 +39,9 @@
 ### 人工作业编辑器
 
 - 分轨时间轴、地图格子点选、同帧排序、复制、删除、撤销和重做。
+- 时间轴像剪辑软件一样操作：拖动标尺移动光标，Shift+滚轮或滚动条横向滚动，Ctrl+滚轮以鼠标为中心缩放。
+- 可导入/导出 [AFC](https://github.com/meijian07/Arknightsframecomputer) 打轴器的 Markdown 轴文件；
+  自己导出的轴可无损导回，手写轴导入为待补全的草稿。
 - 文本与数字在回车或失焦时一次提交，避免每个字符形成一条撤销记录。
 - 编队干员支持按名称片段搜索本地 MAA 干员目录。
 - 干员和部署方向使用下拉菜单；方向包含上、下、左、右和无方向。
