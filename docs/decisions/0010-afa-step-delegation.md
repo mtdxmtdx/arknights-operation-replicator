@@ -23,3 +23,8 @@ running 时以连续两条新 paused 样本结算；单条积压 paused 不得�
 - `afa-step-test` 与主复刻使用同一 AFA 动作；诊断统计可直接用于稳定性判断。
 - `PauseController`、`step-test` 和 `step-sweep` 仅保留为历史/诊断工具，不是现役复刻路径。
 - 尺子仍是帧数和动作是否安全落地的唯一真源；AFA 热键派发成功不等于 Pulse 已确认。
+
+## 后续（2026-11-01）
+
+`PauseController`、`GapTuner`、`step-test`、`step-sweep` 和 `initial_gap_ms` 已从代码中删除。逐帧诊断统一使用
+`afa-step-test`；状态机改用只计数的 `StepStats` 汇报逐帧结算结果。旧配置里的 `initial_gap_ms` 加载时被忽略。

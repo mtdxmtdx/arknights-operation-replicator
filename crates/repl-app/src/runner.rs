@@ -233,7 +233,7 @@ impl<'a> Runner<'a> {
 
         match &result {
             Ok(()) => {
-                let t = self.machine.tuner();
+                let t = self.machine.step_stats();
                 let _ = self.events.send(Progress::Finished {
                     pulses: t.pulses,
                     zero_pulses: t.zero_frame_pulses,

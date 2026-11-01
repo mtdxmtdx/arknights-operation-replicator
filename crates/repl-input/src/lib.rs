@@ -12,7 +12,6 @@
 //! - [`keys`] 键盘注入（`SendInput`，同时带虚拟键码和扫描码）。
 //! - [`mouse`] 指针停靠及 XButton / 滚轮 `SendInput` 注入。
 //! - [`game_keys`] 从注册表读游戏内键位设置。
-//! - [`stepper`] 暂停控制与逐帧脉冲，含闭环间隔自适应。
 //! - [`clock`] 高精度延时与定时器精度 / 线程优先级的 RAII 包装。
 
 pub mod afa;
@@ -20,14 +19,12 @@ pub mod clock;
 pub mod game_keys;
 pub mod keys;
 pub mod mouse;
-pub mod stepper;
 pub mod touch;
 
 pub use afa::{AfaAction, AfaBindings, AfaController, AfaError, AfaHotkey, AfaStatus};
 pub use clock::{precise_sleep, TimeCriticalPriority, TimerResolution};
 pub use game_keys::GameKeys;
 pub use keys::{is_elevated, key_down, key_tap, key_up, KeyCode, DEFAULT_TAP_HOLD};
-pub use stepper::{GapTuner, PauseController};
 pub use touch::TouchInjector;
 
 use repl_core::Point;

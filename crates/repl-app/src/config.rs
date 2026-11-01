@@ -26,8 +26,6 @@ pub const BINDINGS_FILE: &str = "bindings.json";
 pub struct Config {
     /// MAA 的 `resource` 目录。为空时启动向导会尝试自动定位。
     pub maa_resource_dir: String,
-    /// 旧版 Rust 直接脉冲的初始间隔；保留用于兼容现有 config.json，主复刻不再使用。
-    pub initial_gap_ms: u32,
     /// 用户是否已确认免责声明。
     pub disclaimer_accepted: bool,
     /// 尺子的 WebSocket 地址。
@@ -40,7 +38,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             maa_resource_dir: String::new(),
-            initial_gap_ms: repl_core::stepping::DEFAULT_GAP_1X_MS,
             disclaimer_accepted: false,
             ruler_ws_url: repl_frames::DEFAULT_WS_URL.to_owned(),
             ui_scaler_override: None,
@@ -401,7 +398,6 @@ mod tests {
     #[test]
     fn default_config_is_usable() {
         let c = Config::default();
-        assert_eq!(c.initial_gap_ms, repl_core::stepping::DEFAULT_GAP_1X_MS);
         assert!(!c.disclaimer_accepted, "免责声明默认必须是未确认");
         assert!(c.ruler_ws_url.contains("2606"));
     }
@@ -423,9 +419,8 @@ mod tests {
 
     #[test]
     fn partial_config_falls_back_to_defaults() {
-        // 老版本写的配置文件缺字段时不该解析失败
+        // 老版本写的配置文件缺字段、或带着已删除的旧字段（如 initial_gap_ms）时都不该解析失败
         let back: Config = serde_json::from_str(r#"{"initial_gap_ms": 25}"#).unwrap();
-        assert_eq!(back.initial_gap_ms, 25);
         assert!(!back.disclaimer_accepted);
         assert!(back.ruler_ws_url.contains("2606"));
     }

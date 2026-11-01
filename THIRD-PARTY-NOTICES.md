@@ -99,7 +99,6 @@ MAA 游戏资源、AFA、ArknightsCostBarRuler、DirectML 和 VC Runtime 继续�
 | --- | --- |
 | `repl-input/src/touch.rs` | `src/lib/touch_injection.ahk`（`InitializeTouchInjection` / `InjectTouchInput` 的 `POINTER_TOUCH_INFO` 填法与 down/update/up 序列） |
 | `repl-input/src/game_keys.ahk` 对应的 `repl-input/src/game_keys.rs` | `src/lib/game_keys.ahk`（注册表 `KEYBOARD_SETTING_V*` 读取与解析、Unity keyId → 按键名映射表、默认按键） |
-| `repl-input/src/stepper.rs` | `src/lib/hotkey_actions.ahk` (`Action16ms` / `Action33ms` / `Action166ms` 的暂停脉冲时序) |
 | `repl-input/src/clock.rs` | `src/lib/hotkey_actions.ahk` (`USleep` 的 QPC 自旋延时) |
 | `repl-core/src/lib.rs` 中的 `LOGICAL_FPS_1X` 等常量 | 上游 README 的"关于游戏内帧率"一节 |
 
