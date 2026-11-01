@@ -293,6 +293,18 @@ impl OperatorCatalog {
         self.operators.iter().find(|operator| operator.id == id)
     }
 
+    /// 全部干员显示名（去重、排序），供 AFC 轴导入时从自由文本里识别干员名。
+    pub fn display_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .operators
+            .iter()
+            .map(|operator| operator.display_name.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
     /// 按显示名称搜索 MAA 干员目录，供作业编辑器的编队添加框使用。
     ///
     /// 精确匹配和前缀匹配排在包含匹配之前；名称去重后按短名称、字典序稳定排序。

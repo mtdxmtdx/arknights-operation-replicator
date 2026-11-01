@@ -17,6 +17,7 @@
 //! - `gesture` 部署拖拽手势（移植自 MAA 的 `BattleHelper::deploy_oper`）
 //! - `machine` 帧复刻状态机（吃尺子快照，吐注入指令）
 
+pub mod afc_axis;
 pub mod continuation;
 pub mod copilot;
 pub mod geom;
@@ -28,6 +29,7 @@ pub mod stepping;
 pub mod tile;
 pub mod viewport;
 
+pub use afc_axis::{export_axis, import_axis, AxisImport};
 pub use continuation::{ContinuationError, ContinuationPlan};
 pub use copilot::{Action, ActionType, AfterLastAction, Copilot, CopilotError};
 pub use geom::{Direction, Placement, Point, Rect, Role, REF_ASPECT, REF_HEIGHT, REF_WIDTH};
